@@ -1,0 +1,8 @@
+edge-tts
+openai
+funasr
+gradio>=4.0
+python-dotenv
+scipy
+starlette
+uvicorn

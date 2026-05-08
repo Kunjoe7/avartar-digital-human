@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SBIRT Counselor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { background: #ffffff; height: 100%; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; max-width: 480px; margin: 0 auto; }
+
+.header { text-align: center; padding: 10px; background: #16213e; border-bottom: 1px solid #0f3460; }
+.header h1 { font-size: 1.3em; color: #e94560; }
+
+.main { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+
+/* Avatar panel — top, centered */
+.avatar-panel { display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; background: #111; flex: 0 0 auto; padding: 10px 0; }
+.video-container { position: relative; width: 280px; height: 280px; }
+.video-container video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 12px; transition: opacity 0.15s ease; }
+.video-container video.hidden-video { opacity: 0; z-index: 0; }
+.video-container video.active-video { opacity: 1; z-index: 1; }
+.subtitle-bar { width: 100%; max-width: 500px; text-align: center; padding: 8px 16px; font-size: 0.95em; min-height: 32px; color: #ccc; }
+
+/* Chat panel — bottom, scrollable */
+.chat-panel { flex: 1; display: flex; flex-direction: column; border-top: 1px solid #0f3460; min-height: 0; }
+.chat-messages { flex: 1; overflow-y: auto; padding: 10px 16px; }
+.msg { margin-bottom: 8px; padding: 8px 12px; border-radius: 8px; max-width: 80%; word-wrap: break-word; font-size: 0.9em; }
+.msg.user { background: #0f3460; margin-left: auto; }
+.msg.assistant { background: #1a1a3e; border: 1px solid #0f3460; }
+.msg .role { font-size: 0.7em; color: #888; margin-bottom: 2px; }
+
+/* Controls */
+.controls { display: flex; align-items: center; gap: 8px; padding: 8px 14px; background: #16213e; border-top: 1px solid #0f3460; }
+.controls input[type="text"] { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; font-size: 0.9em; }
+.controls button { padding: 8px 14px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9em; font-weight: 500; }
+.btn-start { background: #e94560; color: white; }
+.btn-start.active { background: #4ecca3; }
+.btn-send { background: #0f3460; color: white; }
+.btn-clear { background: #333; color: #ccc; }
+.controls button:hover { opacity: 0.85; }
+
+.status-bar { text-align: center; padding: 5px; background: #111; font-size: 0.8em; color: #888; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SBIRT Counselor</h1>
+</div>
+
+<div class="main">
+  <div class="avatar-panel">
+    <div class="video-container">
+      <video id="videoA" class="active-video" muted autoplay playsinline></video>
+      <video id="videoB" class="hidden-video" muted autoplay playsinline></video>
+    </div>
+    <div class="subtitle-bar" id="subtitle"></div>
+  </div>
+  <div class="chat-panel">
+    <div class="chat-messages" id="chatMessages"></div>
+  </div>
+</div>
+
+<div class="controls">
+  <button class="btn-start" id="btnStart">Start</button>
+  <input type="text" id="textInput" placeholder="Type a message..." />
+  <button class="btn-send" id="btnSend">Send</button>
+  <button class="btn-clear" id="btnClear">Clear</button>
+</div>
+<div class="status-bar" id="statusBar">Click Start to begin</div>
+
+<script>
+(function() {
+  // ============ Elements ============
+  const videoA = document.getElementById('videoA');
+  const videoB = document.getElementById('videoB');
+  const subtitle = document.getElementById('subtitle');
+  const chatMessages = document.getElementById('chatMessages');
+  const btnStart = document.getElementById('btnStart');
+  const btnSend = document.getElementById('btnSend');
+  const btnClear = document.getElementById('btnClear');
+  const textInput = document.getElementById('textInput');
+  const statusBar = document.getElementById('statusBar');
+
+  const IDLE_VIDEO_URL = '/video/assets/idle_loop.mp4';
+  let micActive = false;
+
+  // ============ Double-buffered Video ============
+  let activeVideo = videoA;
+  let preloadVideo = videoB;
+  const videoQueue = [];
+  let isPlayingSegment = false;
+  let preloadReady = false;
+  let preloadItem = null;
+
+  function swapVideos() {
+    activeVideo.classList.remove('active-video');
+    activeVideo.classList.add('hidden-video');
+    preloadVideo.classList.remove('hidden-video');
+    preloadVideo.classList.add('active-video');
+    const tmp = activeVideo;
+    activeVideo = preloadVideo;
+    preloadVideo = tmp;
+  }
+
+  function playIdle() {
+    isPlayingSegment = false;
+    preloadReady = false;
+    preloadItem = null;
+    // Clear preload video
+    preloadVideo.removeAttribute('src');
+    preloadVideo.load();
+    // Play idle on active video
+    activeVideo.loop = true;
+    activeVideo.muted = !micActive;
+    // Only reload src if not already idle
+    if (!activeVideo.src.endsWith('idle_loop.mp4')) {
+      activeVideo.src = IDLE_VIDEO_URL;
+    }
+    activeVideo.play().catch(() => {});
+    subtitle.textContent = '';
+  }
+
+  function enqueueVideo(url, text) {
+    videoQueue.push({ url, text });
+    if (!isPlayingSegment) {
+      playNext();
+    } else {
+      // Try to preload if nothing is preloading yet
+      tryPreload();
+    }
+  }
+
+  function tryPreload() {
+    if (preloadReady || preloadItem) return; // already preloading
+    if (videoQueue.length === 0) return;
+    preloadItem = videoQueue.shift();
+    preloadVideo.loop = false;
+    preloadVideo.src = preloadItem.url;
+    preloadVideo.muted = false;
+    preloadVideo.load();
+  }
+
+  function playNext() {
+    // If we have a preloaded video ready, swap to it
+    if (preloadReady && preloadItem) {
+      const item = preloadItem;
+      preloadReady = false;
+      preloadItem = null;
+      isPlayingSegment = true;
+      swapVideos();
+      activeVideo.play().catch(() => {});
+      subtitle.textContent = item.text;
+      // Start preloading the next one
+      tryPreload();
+      return;
+    }
+
+    // Fallback: load directly on active video
+    if (videoQueue.length === 0) {
+      playIdle();
+      return;
+    }
+    isPlayingSegment = true;
+    const item = videoQueue.shift();
+    activeVideo.loop = false;
+    activeVideo.src = item.url;
+    activeVideo.muted = false;
+    activeVideo.play().catch(() => {});
+    subtitle.textContent = item.text;
+  }
+
+  // Track preload readiness
+  function onCanPlayThrough(e) {
+    if (e.target === preloadVideo && preloadItem) {
+      preloadReady = true;
+    }
+  }
+  videoA.addEventListener('canplaythrough', onCanPlayThrough);
+  videoB.addEventListener('canplaythrough', onCanPlayThrough);
+
+  // When active video ends, play next or restart idle
+  function onEnded(e) {
+    if (e.target !== activeVideo) return;
+    if (isPlayingSegment) {
+      playNext();
+    } else {
+      // Idle video ended unexpectedly — restart loop
+      activeVideo.loop = true;
+      activeVideo.play().catch(() => {});
+    }
+  }
+  videoA.addEventListener('ended', onEnded);
+  videoB.addEventListener('ended', onEnded);
+
+  // Start with idle
+  playIdle();
+
+  // ============ State WebSocket ============
+  let stateWs = null;
+
+  function connectStateWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    stateWs = new WebSocket(proto + '//' + location.host + '/ws/state');
+    stateWs.onopen = () => console.log('[State] WS connected');
+    stateWs.onclose = () => {
+      console.log('[State] WS disconnected, reconnecting...');
+      setTimeout(connectStateWS, 2000);
+    };
+    stateWs.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      handleStateMessage(msg);
+    };
+  }
+
+  function handleStateMessage(msg) {
+    // Update chat history
+    if (msg.chat_history) {
+      renderChat(msg.chat_history);
+    }
+
+    if (msg.type === 'video') {
+      enqueueVideo(msg.video_url, msg.subtitle || '');
+      statusBar.textContent = 'Speaking: ' + (msg.subtitle || '').slice(0, 60);
+    } else if (msg.type === 'video_end') {
+      // Response done — remaining queued videos will finish naturally
+      // playNext handles returning to idle when queue empties
+    } else if (msg.type === 'state') {
+      const s = msg.state || 'idle';
+      if (s === 'listening') statusBar.textContent = 'Listening...';
+      else if (s === 'processing') statusBar.textContent = 'Processing...';
+      else if (s === 'speaking') { /* keep current subtitle status */ }
+      else statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
+    } else if (msg.type === 'reset') {
+      videoQueue.length = 0;
+      preloadReady = false;
+      preloadItem = null;
+      activeVideo.pause();
+      preloadVideo.pause();
+      preloadVideo.removeAttribute('src');
+      preloadVideo.load();
+      playIdle();
+      statusBar.textContent = 'Click Start to begin';
+    }
+  }
+
+  function renderChat(history) {
+    chatMessages.innerHTML = '';
+    for (const m of history) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + m.role;
+      const roleDiv = document.createElement('div');
+      roleDiv.className = 'role';
+      roleDiv.textContent = m.role === 'user' ? 'You' : 'Assistant';
+      div.appendChild(roleDiv);
+      div.appendChild(document.createTextNode(m.content));
+      chatMessages.appendChild(div);
+    }
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  connectStateWS();
+
+  // ============ Audio Capture ============
+  let audioWs = null;
+  let audioCtx = null;
+  let mediaStream = null;
+  let processor = null;
+  let source = null;
+
+  function connectAudioWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    audioWs = new WebSocket(proto + '//' + location.host + '/ws/audio');
+    audioWs.binaryType = 'arraybuffer';
+    audioWs.onopen = () => console.log('[Audio] WS connected');
+    audioWs.onclose = () => {
+      console.log('[Audio] WS disconnected, reconnecting...');
+      if (micActive) setTimeout(connectAudioWS, 2000);
+    };
+  }
+
+  async function startMic() {
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      // Use native sample rate and resample to 16kHz
+      audioCtx = new AudioContext();
+      const nativeSR = audioCtx.sampleRate;
+      console.log('[Audio] Native sample rate:', nativeSR);
+      source = audioCtx.createMediaStreamSource(mediaStream);
+
+      // Use larger buffer for higher native sample rates
+      const bufSize = nativeSR > 16000 ? 8192 : 4096;
+      processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (audioWs && audioWs.readyState === WebSocket.OPEN) {
+          const f32 = e.inputBuffer.getChannelData(0);
+          // Resample to 16kHz
+          const ratio = nativeSR / 16000;
+          const outLen = Math.floor(f32.length / ratio);
+          const i16 = new Int16Array(outLen);
+          for (let i = 0; i < outLen; i++) {
+            const srcIdx = i * ratio;
+            const idx = Math.floor(srcIdx);
+            const frac = srcIdx - idx;
+            const s0 = f32[idx] || 0;
+            const s1 = f32[Math.min(idx + 1, f32.length - 1)] || 0;
+            const s = s0 + frac * (s1 - s0); // linear interpolation
+            const clamped = Math.max(-1, Math.min(1, s));
+            i16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+          }
+          audioWs.send(i16.buffer);
+        }
+      };
+      source.connect(processor);
+      // Connect through silent gain to avoid feedback (mic → speaker loop)
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+      processor.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
+      connectAudioWS();
+      return true;
+    } catch (err) {
+      console.error('[Audio] Failed:', err);
+      alert('Microphone access failed: ' + err.message);
+      return false;
+    }
+  }
+
+  function stopMic() {
+    if (processor) { processor.disconnect(); processor = null; }
+    if (source) { source.disconnect(); source = null; }
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    if (audioWs) { audioWs.close(); audioWs = null; }
+  }
+
+  // ============ Button handlers ============
+  btnStart.addEventListener('click', async () => {
+    if (!micActive) {
+      // Toggle mic on server
+      const resp = await fetch('/api/toggle', { method: 'POST' });
+      const data = await resp.json();
+      if (data.mic === 'on') {
+        const ok = await startMic();
+        if (ok) {
+          micActive = true;
+          btnStart.textContent = 'Stop';
+          btnStart.classList.add('active');
+          statusBar.textContent = 'Listening... speak now';
+          // Unmute video after user interaction
+          activeVideo.muted = false;
+        } else {
+          // Revert server toggle
+          await fetch('/api/toggle', { method: 'POST' });
+        }
+      }
+    } else {
+      await fetch('/api/toggle', { method: 'POST' });
+      stopMic();
+      micActive = false;
+      btnStart.textContent = 'Start';
+      btnStart.classList.remove('active');
+      statusBar.textContent = 'Stopped';
+    }
+  });
+
+  btnSend.addEventListener('click', sendText);
+  textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendText();
+  });
+
+  async function sendText() {
+    const text = textInput.value.trim();
+    if (!text) return;
+    textInput.value = '';
+    await fetch('/api/text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    statusBar.textContent = 'Processing...';
+  }
+
+  btnClear.addEventListener('click', async () => {
+    await fetch('/api/reset', { method: 'POST' });
+    chatMessages.innerHTML = '';
+    subtitle.textContent = '';
+    statusBar.textContent = 'Click Start to begin';
+    if (micActive) {
+      await fetch('/api/toggle', { method: 'POST' });
+      stopMic();
+      micActive = false;
+      btnStart.textContent = 'Start';
+      btnStart.classList.remove('active');
+    }
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Generated / temp media
+tmp/
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
