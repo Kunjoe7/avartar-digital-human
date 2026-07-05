@@ -1,5 +1,9 @@
 # Secrets
 .env
+certs
+assets
+checkpoints
+
 
 # Generated / temp media
 tmp/

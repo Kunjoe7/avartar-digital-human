@@ -5,13 +5,13 @@ Real-time digital human dialogue system: browser mic capture → VAD segmentatio
 ## Architecture
 
 ```
-Browser mic ─WS(7862)─▶ VAD ─speech_end─▶ Pipeline
+Browser mic ─WS(17862)─▶ VAD ─speech_end─▶ Pipeline
 Pipeline: ASR ─▶ LLM(stream) ─▶ split into sentences ─▶ TTS ─▶ FLOAT ─▶ video queue
 WS(/ws/state) pushes the next video segment and subtitle to the frontend
 Barge-in: VAD speech_start ─▶ cancel_event ─▶ clear queue
 ```
 
-Server: Starlette + uvicorn (single port 7861, HTTP + two WebSocket routes).
+Server: Starlette + uvicorn (single port 17861, HTTP + two WebSocket routes).
 Frontend: `static/index.html`, plain HTML/JS, no build step.
 
 ## Layout
@@ -84,7 +84,7 @@ On startup:
 
 - The first run auto-generates `assets/idle_loop.mp4` (~1 minute).
 - Each FLOAT GPU loads the model in roughly 60s.
-- Open `http://<host>:7861/` in a browser, grant microphone permission, click Mic to start a conversation.
+- Open `http://<host>:17861/` in a browser, grant microphone permission, click Mic to start a conversation.
 
 ## Endpoints
 
@@ -101,7 +101,7 @@ On startup:
 
 ## Known Pitfalls
 
-- Port 7860 is often occupied; this app defaults to 7861.
+- Port 7860/7861 are often occupied; this app defaults to 17861.
 - `transformers` cannot be upgraded to 5.x — FLOAT is incompatible.
 - `numpy` must be <2, `opencv-python` must be <4.11.
 - `edge-tts` is async; when calling from a synchronous thread you need `asyncio.run` or a thread pool. See `modules/tts.py`.
