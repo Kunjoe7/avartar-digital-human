@@ -144,6 +144,13 @@ class VoiceActivityDetector:
 
         return (None, None)
 
+    def pending_audio(self):
+        """The utterance-so-far as a float32 array while the user is mid-speech, else
+        None. Used for ASR-confirmed barge-in during avatar playback."""
+        if self.is_speaking and self.speech_buffer:
+            return np.concatenate(self.speech_buffer)
+        return None
+
     def force_end(self):
         """Force end current speech and return buffer."""
         if self.is_speaking and self.speech_buffer:

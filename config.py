@@ -1,9 +1,15 @@
 import os
+import threading
 from dotenv import load_dotenv
 
 from modules.sbirt import build_system_prompt
 
 load_dotenv()
+
+# Set once on server shutdown so every background worker (state poller, temp
+# janitor, FLOAT render busy-wait, LLM producer) can bail out promptly. This is
+# what makes Ctrl+C exit cleanly instead of hanging or throwing tracebacks.
+SHUTTING_DOWN = threading.Event()
 
 # Paths
 FLOAT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "float")
@@ -53,8 +59,8 @@ TTS_VOICE = "en-US-GuyNeural"
 ASR_MODEL = "iic/SenseVoiceSmall"
 
 # GPU allocation
-FLOAT_GPUS = [0, 1, 2]   # 3 GPUs for FLOAT parallel rendering
-ASR_GPU = 3               # Dedicated GPU for ASR
+FLOAT_GPUS = [2]    # 3 GPUs for FLOAT parallel rendering
+ASR_GPU = 2         # Dedicated GPU for ASR
 
 # FLOAT
 FLOAT_NFE = 10            # Number of function evaluations (lower = faster, 7-10)
@@ -65,6 +71,17 @@ FLOAT_NFE_FIRST = 6       # Lower NFE for the FIRST sentence only — buys ~30-4
 # VAD
 VAD_THRESHOLD = 0.5
 VAD_SILENCE_DURATION = 0.35  # seconds of silence to trigger speech_end (lower = snappier)
+
+# --- Barge-in during avatar playback (ASR-confirmed / semantic) ---
+# While the avatar is speaking the VAD onset (speech_start) is unreliable — its own
+# audio can keep the VAD "in speech", and the onset heuristic misses — so barge-in
+# often doesn't fire until the clip finishes. Instead, while the avatar plays,
+# transcribe the incoming mic audio and interrupt the MOMENT it turns into real words
+# (a detected sentence), rejecting the avatar's own echo. Set BARGE_IN_ASR=0 to
+# fall back to VAD-onset-only barge-in.
+BARGE_IN_ASR = os.getenv("BARGE_IN_ASR", "1").lower() not in ("0", "false", "no")
+BARGE_IN_MIN_SPEECH = 0.30   # seconds of user speech before the first ASR check
+BARGE_IN_RECHECK = 0.20      # re-run ASR every this many more seconds of speech until it fires
 
 # --- Performance / latency tuning ---
 # How often the server polls the pipeline for finished video segments and pushes
@@ -111,6 +128,25 @@ SESSION_IDLE_TTL_SEC = 600
 # Idle video
 IDLE_VIDEO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "idle_loop.mp4")
 IDLE_VIDEO_DURATION = 10.0  # seconds; longer = fewer loop seams
+
+# Fixed opening the counselor always says first. Because it is IDENTICAL every
+# session, it is rendered to a cached clip ONCE (assets/greeting.mp4) and replayed
+# — no per-session LLM/TTS/FLOAT, and it appears instantly. Editing GREETING_TEXT
+# regenerates the clip on next startup (a sidecar tracks the text). The spoken part
+# only; the yes/no consent branch is handled by the LLM (see modules/sbirt/workflow.py).
+GREETING_TEXT = (
+    "Hello, I am an AI assistant designed to help understand some important factors "
+    "that may impact your health. This information will be shared with your medical "
+    "provider to help your provider better understand your current health issues. "
+    "Your answers will be treated as confidential and as protected health information. "
+    "May I ask you some questions about your health?"
+)
+GREETING_VIDEO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "greeting.mp4")
+
+# Fixed reply when the user DECLINES consent at the greeting. Cached to a clip too,
+# so it is verbatim + instant like the greeting (no per-session LLM/TTS/FLOAT).
+DECLINE_TEXT = "Thank you, and your provider will address these during your visit."
+DECLINE_VIDEO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "decline.mp4")
 
 # Server / public access
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # bind all interfaces for public access

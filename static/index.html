@@ -89,9 +89,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   // Per-browser session id: isolates this tab's conversation/avatar/mic on the
   // server from every other connected user. Sent on both WebSockets and all
   // HTTP calls.
-  const SESSION_ID = (window.crypto && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : 'sid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  // Persist the session id in sessionStorage so a page reload rejoins the SAME
+  // server session (the connect snapshot then restores the transcript) instead of
+  // silently discarding the conversation. Per-tab; a new tab gets its own session.
+  let SESSION_ID = sessionStorage.getItem('sid');
+  if (!SESSION_ID) {
+    SESSION_ID = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'sid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    sessionStorage.setItem('sid', SESSION_ID);
+  }
   const SID_Q = '?sid=' + encodeURIComponent(SESSION_ID);
 
   // ============ Double-buffered Video ============
@@ -129,10 +136,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     try { activeVideo.currentTime = 0; } catch (e) {}
     activeVideo.play().catch(() => {});
     subtitle.textContent = current.text || '';
+    if (current.idle) {
+      // Back to idle: playback has truly drained, so it's the user's turn now.
+      statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
+    }
 
     // Free the now-hidden buffer and start loading whatever comes next.
     old.pause();
     loadNextIntoPreload();
+  }
+
+  function isPlayingSpeech() {
+    return (current && !current.idle) || videoQueue.length > 0 ||
+           (preloadItem && !preloadItem.idle) || waitingForNext;
   }
 
   function loadNextIntoPreload() {
@@ -181,6 +197,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   videoA.addEventListener('ended', onEnded);
   videoB.addEventListener('ended', onEnded);
 
+  function onVideoError(e) {
+    // A clip failed to load/decode (404, janitor-deleted, network). Never freeze:
+    // skip a failed buffer clip, or treat a failed active clip like a normal end.
+    if (e.target === preloadVideo && preloadItem && !preloadItem.idle) {
+      preloadItem = null;
+      preloadReady = false;
+      loadNextIntoPreload();
+    } else if (e.target === activeVideo && current && !current.idle) {
+      onEnded({ target: activeVideo });
+    }
+  }
+  videoA.addEventListener('error', onVideoError);
+  videoB.addEventListener('error', onVideoError);
+
   function enqueueVideo(url, text) {
     responseEnded = false;
     videoQueue.push({ url, text });
@@ -208,19 +238,23 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   }
 
   function interruptPlayback() {
-    // Barge-in / reset: stop the current response immediately and drop everything
-    // already queued/buffered so the previous answer can't keep playing into the
-    // next turn. Returns to the idle loop until the new response arrives.
+    // Barge-in / stop / reset: drop everything queued/buffered so the previous
+    // answer can't play into the next turn, then dissolve to idle THROUGH the hidden
+    // buffer. We never change the visible element's src (that caused a black flash);
+    // the current last frame is held until the idle clip is decoded, then swapped.
     videoQueue.length = 0;
     preloadItem = null;
     preloadReady = false;
-    waitingForNext = false;
-    responseEnded = false;
     try { activeVideo.pause(); } catch (e) {}
     try { preloadVideo.pause(); } catch (e) {}
-    preloadVideo.removeAttribute('src');
-    preloadVideo.load();
-    startIdle();
+    if (current && current.idle) {
+      waitingForNext = false;
+      responseEnded = false;
+      return;                 // already idle — nothing to dissolve to
+    }
+    waitingForNext = true;    // hold the current last frame until idle is ready
+    responseEnded = true;     // lets loadNextIntoPreload prepare the idle clip
+    loadNextIntoPreload();    // preload idle → onPreloadReady swaps (dissolve, no flash)
   }
 
   // Start with idle
@@ -266,7 +300,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
       }
       else if (s === 'processing') statusBar.textContent = 'Processing...';
       else if (s === 'speaking') { /* keep current subtitle status */ }
-      else statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
+      else {
+        // The server goes idle BEFORE the browser finishes playing buffered clips.
+        // Only announce "ready" once playback has actually drained; otherwise the
+        // swap-to-idle in swapToPreload will set it at the right moment.
+        if (!isPlayingSpeech()) {
+          statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
+        }
+      }
     } else if (msg.type === 'reset') {
       chatState = [];
       chatMessages.innerHTML = '';
@@ -278,29 +319,40 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   function makeMsgNode(m) {
     const div = document.createElement('div');
     div.className = 'msg ' + m.role;
+    div.dataset.role = m.role;
     const roleDiv = document.createElement('div');
     roleDiv.className = 'role';
     roleDiv.textContent = m.role === 'user' ? 'You' : 'Assistant';
     div.appendChild(roleDiv);
-    div.appendChild(document.createTextNode(m.content));
+    div.appendChild(document.createTextNode(m.content));  // lastChild = content text
     return div;
   }
 
   // Apply an incremental chat update. The server sends only the changed suffix
-  // (msg.from = first changed index, msg.msgs = messages from there on), so we
-  // rebuild just the tail instead of the whole list — no full-DOM churn, no
-  // flicker, and scrollback is preserved unless the user is already at the bottom.
+  // (msg.from = first changed index, msg.msgs = messages from there on). We
+  // reconcile in place: the streaming assistant bubble's TEXT is updated on its
+  // existing node (so text selection isn't wiped and there's no flicker); nodes are
+  // only created/replaced when the role differs. Scrollback is preserved unless the
+  // user is already at the bottom.
   function applyChatDelta(msg) {
     const from = msg.from | 0;
     const atBottom = chatMessages.scrollTop + chatMessages.clientHeight
                      >= chatMessages.scrollHeight - 40;
     chatState.length = from;
     for (const m of (msg.msgs || [])) chatState.push(m);
-    while (chatMessages.children.length > from) {
+    while (chatMessages.children.length > chatState.length) {
       chatMessages.removeChild(chatMessages.lastChild);
     }
     for (let i = from; i < chatState.length; i++) {
-      chatMessages.appendChild(makeMsgNode(chatState[i]));
+      const m = chatState[i];
+      const node = chatMessages.children[i];
+      if (node && node.dataset.role === m.role) {
+        node.lastChild.textContent = m.content;           // update in place
+      } else if (node) {
+        chatMessages.replaceChild(makeMsgNode(m), node);
+      } else {
+        chatMessages.appendChild(makeMsgNode(m));
+      }
     }
     if (atBottom) chatMessages.scrollTop = chatMessages.scrollHeight;
   }
@@ -406,17 +458,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
           micActive = true;
           btnStart.textContent = 'Stop';
           btnStart.classList.add('active');
-          statusBar.textContent = 'Listening... speak now';
+          statusBar.textContent = 'Listening…';
           // Unmute video after user interaction
           activeVideo.muted = false;
+          // Counselor leads: greet now that the mic is confirmed live. (Kept
+          // separate from the toggle so a denied mic or a Clear never greets.)
+          fetch('/api/greet' + SID_Q, { method: 'POST' });
         } else {
-          // Revert server toggle
+          // Mic denied — revert the server toggle so no phantom greeting fires.
           await fetch('/api/toggle' + SID_Q, { method: 'POST' });
         }
       }
     } else {
       await fetch('/api/toggle' + SID_Q, { method: 'POST' });
       stopMic();
+      interruptPlayback();          // Stop actually stops the avatar mid-response
       micActive = false;
       btnStart.textContent = 'Start';
       btnStart.classList.remove('active');
@@ -433,6 +489,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     const text = textInput.value.trim();
     if (!text) return;
     textInput.value = '';
+    interruptPlayback();   // typing interrupts the current answer immediately
     await fetch('/api/text' + SID_Q, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -442,12 +499,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   }
 
   btnClear.addEventListener('click', async () => {
+    // api_reset already disables the mic server-side and returns the mic state, so
+    // we must NOT issue a second /api/toggle here (that flipped the server back ON,
+    // desyncing the toggle so the next Start was a silent no-op, and — with greeting
+    // tied to the toggle — fired a phantom greeting). Just tear down locally.
     await fetch('/api/reset' + SID_Q, { method: 'POST' });
+    chatState = [];
     chatMessages.innerHTML = '';
     subtitle.textContent = '';
     statusBar.textContent = 'Click Start to begin';
     if (micActive) {
-      await fetch('/api/toggle' + SID_Q, { method: 'POST' });
       stopMic();
       micActive = false;
       btnStart.textContent = 'Start';

@@ -151,6 +151,42 @@ def chat_stream(messages: list[dict],
         yield buffer.strip()
 
 
+_CONSENT_SYSTEM = (
+    "A health-screening tool asked the user: 'May I ask you some questions about your "
+    "health?'. Read ONLY the user's reply and classify their intent as exactly one "
+    "lowercase word:\n"
+    "  yes — they clearly agree to proceed (incl. 'sure', 'ok', 'go ahead', 'no problem')\n"
+    "  no — they clearly decline the screening ('no', 'not now', \"I'd rather not\")\n"
+    "  unclear — anything else, OR any sign of distress/crisis/off-topic.\n"
+    "Output only that one word."
+)
+
+
+def classify_consent(text: str) -> str:
+    """Classify the user's reply to the greeting's consent question as
+    'yes' | 'no' | 'unclear'. Conservative: distress/crisis/ambiguous -> 'unclear'
+    so it is routed to the full counselor (with the crisis protocol), never to the
+    fixed decline. Returns 'unclear' on any failure."""
+    if not text or not text.strip():
+        return "unclear"
+    try:
+        resp = _client().chat.completions.create(
+            model=config.LLM_MODEL,
+            messages=[{"role": "system", "content": _CONSENT_SYSTEM},
+                      {"role": "user", "content": text}],
+            temperature=0,
+        )
+        out = (resp.choices[0].message.content or "").strip().lower()
+        if out.startswith("yes"):
+            return "yes"
+        if out.startswith("no"):
+            return "no"
+        return "unclear"
+    except Exception as e:
+        logger.info("consent classification skipped (%s)", e)
+        return "unclear"
+
+
 if __name__ == "__main__":
     msgs = build_messages([{"role": "user", "content": "Hello, please briefly introduce yourself"}])
     print(f"LLM reply: {chat(msgs)}")

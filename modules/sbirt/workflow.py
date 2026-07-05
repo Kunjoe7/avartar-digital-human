@@ -30,13 +30,15 @@ class Node:
 NODES = (
     Node(
         "GREETING",
-        "Open warmly, set the frame (a brief, low-pressure check-in), find out the "
-        "person's age (and sex if it comes up naturally) so the right tools are "
-        "used, and get consent to talk.",
-        "Introduce yourself in one line and ask an open opening question; early on, "
-        "establish their age naturally — it decides adult tools vs CRAFFT (≤21).",
-        ("user engages → PRE_SCREEN",
-         "user declines → CLOSE (respect autonomy)",
+        "The FIXED opening was already delivered to the user as the first clip: it "
+        "introduces the tool, says the info is shared with their provider and treated "
+        "as confidential PHI, and ASKS consent to proceed. Your job begins at their reply.",
+        "Do NOT re-introduce yourself or repeat the opening. Handle the consent answer: "
+        "if they agree, move into screening; if they decline, thank them warmly and note "
+        "their provider will address these during the visit. Early on, establish age "
+        "naturally — it decides adult tools vs CRAFFT (≤21).",
+        ("user consents → PRE_SCREEN",
+         "user declines → CLOSE (say exactly: 'Thank you, and your provider will address these during your visit.')",
          "crisis cue at any point → CRISIS"),
     ),
     Node(

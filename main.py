@@ -1,10 +1,12 @@
 import os
 import sys
+import re
 import time
 import json
 import asyncio
 import logging
 import threading
+from contextlib import asynccontextmanager
 import numpy as np
 
 import config
@@ -23,6 +25,7 @@ from starlette.staticfiles import StaticFiles
 
 from modules.pipeline import Pipeline
 from modules.vad import VoiceActivityDetector
+from modules import asr
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,6 +42,9 @@ class Session:
         self.vad = VoiceActivityDetector()
         self.mic_enabled = False
         self.speech_started_notified = False
+        # ASR-confirmed barge-in bookkeeping (per audio stream).
+        self.barge_done = False   # already barged-in for the current utterance
+        self.barge_last_n = 0     # sample count at the last barge ASR check
         self.state_clients: set[WebSocket] = set()
         # state_poller bookkeeping (per session)
         self.last_state = None
@@ -98,22 +104,33 @@ async def api_toggle(request: Request):
     session = await session_for(request)
     session.mic_enabled = not session.mic_enabled
     status = "on" if session.mic_enabled else "off"
+    if not session.mic_enabled:
+        session.pipeline.cancel_response()  # Stop silences the avatar mid-response
     logger.info(f"Mic toggled: {status}")
-    # Counselor leads: when the mic is first enabled for a fresh conversation,
-    # have the avatar greet and ask the opening question instead of waiting for
-    # the user to speak first (drives the SBIRT GREETING node).
-    if session.mic_enabled and not session.pipeline.chat_history:
-        session.pipeline.start_greeting()
     return JSONResponse({"mic": status})
+
+
+async def api_greet(request: Request):
+    """Counselor leads: deliver the fixed opening. The client calls this ONLY after
+    the mic is confirmed live, so we never greet on a denied mic or on a Clear (both
+    of which previously happened when greeting was tied to the mic toggle)."""
+    session = await session_for(request)
+    p = session.pipeline
+    if session.mic_enabled and not p.chat_history and not p.awaiting_consent:
+        p.start_greeting()
+    return JSONResponse({"status": "ok"})
 
 
 async def api_reset(request: Request):
     session = await session_for(request)
-    session.pipeline.reset()
+    # reset() sleeps ~100ms to let in-flight threads observe cancellation; run it off
+    # the event loop so a Clear doesn't stall video delivery for every other session.
+    await asyncio.get_running_loop().run_in_executor(None, session.pipeline.reset)
     session.mic_enabled = False
     session.sent_chat = []  # next delta re-pushes from scratch
     await broadcast(session.state_clients, {"type": "reset"})
-    return JSONResponse({"status": "ok"})
+    # Return the authoritative mic state so the client syncs without a 2nd toggle.
+    return JSONResponse({"status": "ok", "mic": "off"})
 
 
 async def api_text(request: Request):
@@ -124,7 +141,9 @@ async def api_text(request: Request):
         return JSONResponse({"error": "empty"}, status_code=400)
 
     session = await session_for(request)
-    # Run pipeline in background thread (blocking operations)
+    # Typing interrupts the current answer (like a voice barge-in): cancel the
+    # in-flight response and drop its queued clips before starting the new turn.
+    session.pipeline.on_speech_start()
     threading.Thread(target=session.pipeline.on_speech_end_text, args=(text,), daemon=True).start()
     return JSONResponse({"status": "processing"})
 
@@ -163,8 +182,31 @@ async def api_test_asr(request: Request):
 
 # --------------- Audio WebSocket ---------------
 
+_word_re = re.compile(r"[^a-z0-9 ]+")
+
+
+def _looks_like_echo(text: str, pipeline) -> bool:
+    """The mic during playback may pick up the avatar's OWN leaked voice. Treat a
+    transcription as echo (ignore it) if its words are contained in what the avatar
+    is currently saying; real user speech won't match. Empty -> echo."""
+    def norm(s):
+        return " ".join(_word_re.sub(" ", s.lower()).split())
+    u = norm(text)
+    if not u:
+        return True
+    resp = ""
+    for m in reversed(pipeline.chat_history):
+        if m.get("role") == "assistant":
+            resp = m.get("content", "")
+            break
+    return u in norm(resp)
+
+
 async def ws_audio(websocket: WebSocket):
     await websocket.accept()
+    if config.SHUTTING_DOWN.is_set():
+        await websocket.close()
+        return
     session = await session_for(websocket)
     logger.info("Audio WebSocket client connected")
     session.speech_started_notified = False
@@ -173,6 +215,10 @@ async def ws_audio(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_bytes()
+            # Stop dispatching new VAD work once shutting down so no executor job is
+            # left running to block/hang the event loop teardown on Ctrl+C.
+            if config.SHUTTING_DOWN.is_set():
+                break
             if not session.mic_enabled:
                 continue
 
@@ -190,12 +236,41 @@ async def ws_audio(websocket: WebSocket):
                 None, session.vad.process_chunk, audio_chunk
             )
 
+            # ASR-confirmed (semantic) barge-in: while the avatar is speaking, the VAD
+            # onset is unreliable, so transcribe the user's speech-so-far and interrupt
+            # the MOMENT it becomes real words (rejecting the avatar's own echo).
+            if config.BARGE_IN_ASR and session.pipeline.state in ("processing", "speaking"):
+                pending = session.vad.pending_audio()
+                if pending is None:
+                    session.barge_done = False
+                    session.barge_last_n = 0
+                elif not session.barge_done:
+                    n = len(pending)
+                    first = int(config.BARGE_IN_MIN_SPEECH * 16000)
+                    step = int(config.BARGE_IN_RECHECK * 16000)
+                    due = (n >= first) if session.barge_last_n == 0 \
+                        else (n >= session.barge_last_n + step)
+                    if due:
+                        session.barge_last_n = n
+                        text = await asyncio.get_running_loop().run_in_executor(
+                            None, asr.transcribe_array, pending)
+                        if text.strip() and not _looks_like_echo(text, session.pipeline):
+                            logger.info("[barge-in] user speech detected: %r -> interrupting", text)
+                            session.barge_done = True
+                            session.speech_started_notified = True
+                            session.pipeline.on_speech_start()
+            else:
+                session.barge_done = False
+                session.barge_last_n = 0
+
             if event == "speech_start" and not session.speech_started_notified:
                 session.speech_started_notified = True
                 session.pipeline.on_speech_start()
 
             elif event == "speech_end":
                 session.speech_started_notified = False
+                session.barge_done = False
+                session.barge_last_n = 0
                 # Debug: log audio stats
                 duration = len(audio_data) / 16000
                 rms = np.sqrt(np.mean(audio_data**2))
@@ -218,6 +293,9 @@ async def ws_audio(websocket: WebSocket):
 
 async def ws_state(websocket: WebSocket):
     await websocket.accept()
+    if config.SHUTTING_DOWN.is_set():
+        await websocket.close()
+        return
     session = await session_for(websocket)
     session.state_clients.add(websocket)
     session.empty_since = None
@@ -352,18 +430,26 @@ async def _push_chat_delta(session: Session):
 
 async def state_poller():
     """Background task: poll every session's pipeline and push to its own clients."""
-    while True:
-        await asyncio.sleep(config.STATE_POLL_INTERVAL)
-        # Never let a transient error kill this task: it is the ONLY producer of
-        # video/state pushes to every frontend, so if it dies all avatars freeze
-        # mid-response and stay broken until restart.
-        try:
-            for session in list(sessions.values()):
-                if not session.state_clients:
-                    continue
-                await _poll_session(session)
-        except Exception:
-            logger.exception("state_poller iteration failed; continuing")
+    try:
+        while True:
+            await asyncio.sleep(config.STATE_POLL_INTERVAL)
+            if config.SHUTTING_DOWN.is_set():
+                return
+            # Never let a transient error kill this task: it is the ONLY producer of
+            # video/state pushes to every frontend, so if it dies all avatars freeze
+            # mid-response and stay broken until restart. (asyncio.CancelledError is
+            # a BaseException, so this `except Exception` correctly lets shutdown
+            # cancellation through — do not widen it to BaseException.)
+            try:
+                for session in list(sessions.values()):
+                    if not session.state_clients:
+                        continue
+                    await _poll_session(session)
+            except Exception:
+                logger.exception("state_poller iteration failed; continuing")
+    except asyncio.CancelledError:
+        # Clean shutdown: the lifespan handler cancelled us. Exit quietly.
+        return
 
 
 # --------------- App setup ---------------
@@ -380,10 +466,17 @@ def _warmup_models():
                     config.FLOAT_GPUS, config.ASR_GPU)
         from modules import avatar, asr
         avatar.get_pool()
+        if config.SHUTTING_DOWN.is_set():
+            return
         asr.get_model()
-        if getattr(config, "USE_EOU", False):
+        if getattr(config, "USE_EOU", False) and not config.SHUTTING_DOWN.is_set():
             from modules import eou
             eou.get_model()  # self-handles failure -> falls back to silence VAD
+        # Pre-render the fixed greeting + decline clips to cache once, so the opening
+        # and a consent-decline both play instantly (no LLM/TTS/FLOAT at request time).
+        if not config.SHUTTING_DOWN.is_set():
+            from modules.pipeline import prewarm_fixed_clips
+            prewarm_fixed_clips()
         logger.info("Model pre-warm complete; first response will be fast.")
     except Exception as e:
         logger.warning("Model pre-warm failed (will lazy-load on demand): %s", e)
@@ -415,7 +508,9 @@ def _temp_janitor():
     ttl = getattr(config, "TEMP_FILE_TTL_SEC", 180)
     interval = getattr(config, "TEMP_CLEAN_INTERVAL_SEC", 30)
     exts = (".mp4", ".wav", ".txt", ".mp3")
-    while True:
+    # Wait on the shutdown event instead of time.sleep so Ctrl+C exits this daemon
+    # thread promptly (a long time.sleep left it to be killed mid-work at teardown).
+    while not config.SHUTTING_DOWN.is_set():
         try:
             now = time.time()
             removed = 0
@@ -434,13 +529,26 @@ def _temp_janitor():
             _reap_idle_sessions()
         except Exception:
             logger.exception("temp janitor iteration failed; continuing")
-        time.sleep(interval)
+        config.SHUTTING_DOWN.wait(interval)
 
 
-async def on_startup():
-    asyncio.create_task(state_poller())
+@asynccontextmanager
+async def lifespan(app):
+    """Start background work on boot and tear it down deterministically on shutdown
+    so Ctrl+C exits cleanly — cancels the state poller (else asyncio logs "Task was
+    destroyed but it is pending!") and flips SHUTTING_DOWN so the daemon threads,
+    the FLOAT render busy-wait, and the LLM producer stop instead of being killed
+    mid-work. (Uses the lifespan API, which works across Starlette versions;
+    on_startup/on_shutdown were removed in newer Starlette.)"""
+    poller = asyncio.create_task(state_poller())
     threading.Thread(target=_warmup_models, name="warmup", daemon=True).start()
     threading.Thread(target=_temp_janitor, name="janitor", daemon=True).start()
+    try:
+        yield
+    finally:
+        config.SHUTTING_DOWN.set()
+        poller.cancel()
+        await asyncio.gather(poller, return_exceptions=True)
 
 
 # Ensure static directory exists
@@ -451,6 +559,7 @@ app = Starlette(
         Route("/", index),
         Route("/video/{subdir}/{filename}", serve_video),
         Route("/api/toggle", api_toggle, methods=["POST"]),
+        Route("/api/greet", api_greet, methods=["POST"]),
         Route("/api/reset", api_reset, methods=["POST"]),
         Route("/api/text", api_text, methods=["POST"]),
         Route("/api/test_asr", api_test_asr, methods=["POST"]),
@@ -458,50 +567,58 @@ app = Starlette(
         WebSocketRoute("/ws/state", ws_state),
         Mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static"),
     ],
-    on_startup=[on_startup],
+    lifespan=lifespan,
 )
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # Generate idle video if it doesn't exist
-    if not os.path.exists(config.IDLE_VIDEO_PATH):
-        logger.info("Generating idle loop video (first-time setup)...")
-        from modules import avatar
-        try:
-            avatar.generate_idle_video(duration=config.IDLE_VIDEO_DURATION)
-            logger.info(f"Idle video saved to {config.IDLE_VIDEO_PATH}")
-        except Exception as e:
-            logger.warning(f"Could not generate idle video: {e}")
+    try:
+        # Generate idle video if it doesn't exist
+        if not os.path.exists(config.IDLE_VIDEO_PATH):
+            logger.info("Generating idle loop video (first-time setup)...")
+            from modules import avatar
+            try:
+                avatar.generate_idle_video(duration=config.IDLE_VIDEO_DURATION)
+                logger.info(f"Idle video saved to {config.IDLE_VIDEO_PATH}")
+            except Exception as e:
+                logger.warning(f"Could not generate idle video: {e}")
 
-    # Enable HTTPS for public access (browser mic requires a secure context
-    # on any non-localhost origin). Falls back to plain HTTP if certs are missing.
-    ssl_kwargs = {}
-    have_certs = os.path.exists(config.SSL_CERT_FILE) and os.path.exists(config.SSL_KEY_FILE)
-    if config.ENABLE_HTTPS and have_certs:
-        ssl_kwargs = {
-            "ssl_certfile": config.SSL_CERT_FILE,
-            "ssl_keyfile": config.SSL_KEY_FILE,
-        }
-        scheme = "https"
-    else:
-        scheme = "http"
-        if config.ENABLE_HTTPS and not have_certs:
-            logger.warning(
-                "ENABLE_HTTPS is set but certs not found at %s / %s — serving plain HTTP. "
-                "Microphone will only work via localhost.",
-                config.SSL_CERT_FILE, config.SSL_KEY_FILE,
-            )
+        # Enable HTTPS for public access (browser mic requires a secure context
+        # on any non-localhost origin). Falls back to plain HTTP if certs are missing.
+        ssl_kwargs = {}
+        have_certs = os.path.exists(config.SSL_CERT_FILE) and os.path.exists(config.SSL_KEY_FILE)
+        if config.ENABLE_HTTPS and have_certs:
+            ssl_kwargs = {
+                "ssl_certfile": config.SSL_CERT_FILE,
+                "ssl_keyfile": config.SSL_KEY_FILE,
+            }
+            scheme = "https"
+        else:
+            scheme = "http"
+            if config.ENABLE_HTTPS and not have_certs:
+                logger.warning(
+                    "ENABLE_HTTPS is set but certs not found at %s / %s — serving plain HTTP. "
+                    "Microphone will only work via localhost.",
+                    config.SSL_CERT_FILE, config.SSL_KEY_FILE,
+                )
 
-    logger.info(
-        "Serving on %s://%s:%d  (open %s://<your-host>:%d/ from the public internet)",
-        scheme, config.SERVER_HOST, config.SERVER_PORT, scheme, config.SERVER_PORT,
-    )
-    uvicorn.run(
-        app,
-        host=config.SERVER_HOST,
-        port=config.SERVER_PORT,
-        log_level="info",
-        **ssl_kwargs,
-    )
+        logger.info(
+            "Serving on %s://%s:%d  (open %s://<your-host>:%d/ from the public internet)",
+            scheme, config.SERVER_HOST, config.SERVER_PORT, scheme, config.SERVER_PORT,
+        )
+        uvicorn.run(
+            app,
+            host=config.SERVER_HOST,
+            port=config.SERVER_PORT,
+            log_level="info",
+            **ssl_kwargs,
+        )
+    except KeyboardInterrupt:
+        # Ctrl+C BEFORE uvicorn installs its signal handlers (e.g. during first-run
+        # idle-video generation) would otherwise dump a raw KeyboardInterrupt
+        # traceback. Exit cleanly instead.
+        config.SHUTTING_DOWN.set()
+        logger.info("Interrupted during startup; exiting.")
+        sys.exit(0)

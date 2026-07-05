@@ -24,12 +24,17 @@ def synthesize(text: str, output_path: str | None = None,
     except RuntimeError:
         loop = None
 
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            pool.submit(asyncio.run, _synthesize(text, config.TTS_VOICE, output_path)).result()
-    else:
-        asyncio.run(_synthesize(text, config.TTS_VOICE, output_path))
+    # edge-tts hits a remote Microsoft endpoint per sentence; a transient failure
+    # must degrade to "skip this clip" (return None), never raise and freeze the turn.
+    try:
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pool.submit(asyncio.run, _synthesize(text, config.TTS_VOICE, output_path)).result()
+        else:
+            asyncio.run(_synthesize(text, config.TTS_VOICE, output_path))
+    except Exception:
+        return None
     return output_path
 
 

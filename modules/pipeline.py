@@ -12,6 +12,50 @@ from modules import asr, llm, tts, avatar
 
 logger = logging.getLogger(__name__)
 
+_fixed_clip_lock = threading.Lock()
+
+
+def ensure_fixed_clip(text, path):
+    """Render a FIXED line (`text`) to a cached clip at `path` ONCE and reuse it —
+    no per-session LLM/TTS/FLOAT, plays instantly. Regenerates only if the text
+    changed (tracked via a sidecar .txt). Returns the cached path, or None on failure.
+    Used for the always-identical greeting and consent-decline clips."""
+    sidecar = path + ".txt"
+    with _fixed_clip_lock:
+        try:
+            if os.path.exists(path) and os.path.exists(sidecar):
+                with open(sidecar, encoding="utf-8") as f:
+                    if f.read() == text:
+                        return path  # cached and up to date
+        except OSError:
+            pass
+        try:
+            tts_path = tts.synthesize(text, None, None)
+            if not tts_path:
+                return None
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            result = avatar.generate_video(tts_path, output_path=path)
+            try:
+                os.remove(tts_path)
+            except OSError:
+                pass
+            if result is None:
+                return None
+            with open(sidecar, "w", encoding="utf-8") as f:
+                f.write(text)
+            logger.info("Fixed clip cached at %s", path)
+            return path
+        except Exception as e:
+            logger.warning("Fixed clip generation failed for %s: %s", path, e)
+            return None
+
+
+def prewarm_fixed_clips():
+    """Pre-render the fixed greeting + decline clips once (called at startup warmup)
+    so both play instantly on first use."""
+    ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
+    ensure_fixed_clip(config.DECLINE_TEXT, config.DECLINE_VIDEO_PATH)
+
 
 class Pipeline:
     """State machine: idle → listening → processing → speaking → idle"""
@@ -26,6 +70,10 @@ class Pipeline:
         # injected into the prompt every turn so it survives history-window trimming
         # and the model never loses key clinical facts.
         self.patient = {}
+        # True from when the fixed greeting is delivered until the user's consent
+        # reply is handled — that one turn is routed through classify_consent so a
+        # "no" gets the fixed decline clip instead of the full LLM.
+        self.awaiting_consent = False
         self._lock = threading.Lock()
         self._processing_thread = None
         # Track which sentences were actually played
@@ -64,6 +112,19 @@ class Pipeline:
             self._played_sentences = []
 
         self.state = "listening"
+
+    def cancel_response(self):
+        """Stop any in-flight response immediately and end at idle (used by Stop and
+        by text-send interruption). Drops queued clips; leaves histories intact."""
+        if self.state in ("processing", "speaking"):
+            self.cancel_event.set()
+            self._turn += 1
+            while not self.video_queue.empty():
+                try:
+                    self.video_queue.get_nowait()
+                except queue.Empty:
+                    break
+        self.state = "idle"
 
     def on_speech_end(self, audio_array):
         """Called by audio_server when user finishes speaking.
@@ -114,25 +175,51 @@ class Pipeline:
         self._processing_thread.start()
 
     def _process_greeting(self, turn):
+        """Deliver the fixed opening from the cached clip — no LLM/TTS/FLOAT. Records
+        it as the assistant's first turn so the conversation flows straight into the
+        user's yes/no consent reply."""
         try:
             if self._aborted(turn):
                 self.state = "idle"
                 return
-            self.state = "processing"
-            self._run_synthesis(self._greeting_messages(), turn, is_greeting=True)
+            text = config.GREETING_TEXT
+            video = ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
+            # Record the fixed opening as the assistant's first turn in both histories.
+            self._history_set_assistant(text)
+            # The next user turn is the consent answer — route it through the gate.
+            self.awaiting_consent = True
+            if video and not self._aborted(turn):
+                self.video_queue.put({
+                    "video": video,
+                    "sentence": text,
+                    "_t_enqueue": time.perf_counter(),
+                })
+                self.state = "speaking"
+                self.video_queue.put(None)
+            else:
+                # No clip (generation failed / not ready) — the text greeting still shows.
+                self.state = "idle"
         except Exception as e:
             logger.error(f"Greeting error: {e}", exc_info=True)
             self.state = "idle"
 
-    def _greeting_messages(self):
-        """Messages for the opening turn. The SBIRT prompt already says to enter at
-        the GREETING node, so an ephemeral (non-persisted) kickoff is enough to make
-        the model open. Only the assistant greeting it produces is stored, so the
-        conversation history starts cleanly with the counselor's first line."""
-        kickoff = {"role": "user", "content":
-                   "[Session start. Greet the user in one short line and ask your "
-                   "opening question now — do not wait for them to speak first.]"}
-        return llm.build_messages(self.llm_history, dict(self.patient)) + [kickoff]
+    def _deliver_decline(self, user_text, turn):
+        """User declined consent: record their reply + the FIXED thank-you line, play
+        the cached decline clip, and end the turn. No screening, no dynamic LLM."""
+        self._history_begin(user_text)          # record the user's "no" in both histories
+        text = config.DECLINE_TEXT
+        video = ensure_fixed_clip(text, config.DECLINE_VIDEO_PATH)
+        self._history_set_assistant(text)
+        if video and not self._aborted(turn):
+            self.video_queue.put({
+                "video": video,
+                "sentence": text,
+                "_t_enqueue": time.perf_counter(),
+            })
+            self.state = "speaking"
+            self.video_queue.put(None)
+        else:
+            self.state = "idle"
 
     # ---------- Shared history management (both histories move together) ----------
     # chat_history (frontend display) and llm_history (sent to the API) are kept in
@@ -205,6 +292,15 @@ class Pipeline:
                 self.state = "idle"
                 return
 
+            # Consent gate: the turn right after the greeting is the yes/no answer.
+            # A clear decline gets the fixed cached clip; yes/unclear/distress fall
+            # through to the full counselor (which owns the crisis protocol).
+            if self.awaiting_consent:
+                self.awaiting_consent = False
+                if llm.classify_consent(user_text) == "no":
+                    self._deliver_decline(user_text, turn)
+                    return
+
             # Step 2: append the user turn to BOTH histories, then synthesize.
             messages = self._history_begin(user_text)
             self.state = "processing"
@@ -221,6 +317,13 @@ class Pipeline:
                 self.state = "idle"
                 return
 
+            # Consent gate (same as the voice path): a clear decline -> fixed clip.
+            if self.awaiting_consent:
+                self.awaiting_consent = False
+                if llm.classify_consent(user_text) == "no":
+                    self._deliver_decline(user_text, turn)
+                    return
+
             messages = self._history_begin(user_text)
             self.state = "processing"
             self._run_synthesis(messages, turn)
@@ -229,21 +332,21 @@ class Pipeline:
             logger.error(f"Pipeline error (text): {e}", exc_info=True)
             self.state = "idle"
 
-    def _run_synthesis(self, messages, turn, is_greeting=False):
+    def _run_synthesis(self, messages, turn):
         """Dispatch to the configured synthesis mode. `messages` is the full API
-        message list (system + history + current user, or the greeting kickoff)
-        built by the caller; the user turn is already in both histories."""
+        message list (system + history + current user) built by the caller; the user
+        turn is already in both histories."""
         mode = getattr(config, "SYNTHESIS_MODE", "stream_parallel")
         if mode == "batch":
-            self._run_batch_synthesis(messages, turn, is_greeting)
+            self._run_batch_synthesis(messages, turn)
         elif mode == "stream":
-            self._run_pipelined_synthesis(messages, turn, is_greeting)
+            self._run_pipelined_synthesis(messages, turn)
         elif mode == "hybrid":
-            self._run_hybrid_synthesis(messages, turn, is_greeting)
+            self._run_hybrid_synthesis(messages, turn)
         else:
-            self._run_streaming_parallel_synthesis(messages, turn, is_greeting)
+            self._run_streaming_parallel_synthesis(messages, turn)
 
-    def _run_streaming_parallel_synthesis(self, messages, turn, is_greeting=False):
+    def _run_streaming_parallel_synthesis(self, messages, turn):
         """Fastest mode: stream sentences from the LLM (chat text appears live in
         <1s) AND render each sentence's TTS+FLOAT concurrently across the whole
         GPU pool, while enqueuing strictly in sentence order.
@@ -259,7 +362,7 @@ class Pipeline:
         n_gpus = max(1, len(config.FLOAT_GPUS))
 
         def _render(sentence, idx):
-            if self._aborted(turn):
+            if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
                 return None
             # First sentence renders at a lower NFE to get the avatar talking sooner.
             nfe = config.FLOAT_NFE_FIRST if idx == 0 else config.FLOAT_NFE
@@ -285,7 +388,7 @@ class Pipeline:
                 for idx, sentence in enumerate(
                     llm.chat_stream(messages, cancel_event=self.cancel_event)
                 ):
-                    if self._aborted(turn):
+                    if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
                         break
                     if idx == 0:
                         logger.info("[latency] LLM first sentence at +%.2fs",
@@ -327,7 +430,14 @@ class Pipeline:
                 if self._aborted(turn):
                     fut.cancel()
                     continue  # keep draining to SENTINEL so the producer finishes
-                video_path = fut.result()
+                try:
+                    video_path = fut.result()
+                except Exception:
+                    # A single sentence's TTS/FLOAT failing must NOT abort the whole
+                    # turn (which would skip the video_end sentinel below and freeze
+                    # the avatar on its last frame). Skip this clip and continue.
+                    logger.exception("segment render failed; skipping this clip")
+                    continue
                 if video_path is None or self._aborted(turn):
                     continue
                 self.video_queue.put({
@@ -365,7 +475,7 @@ class Pipeline:
             sentences.append(buf.strip())
         return sentences
 
-    def _run_hybrid_synthesis(self, messages, turn, is_greeting=False):
+    def _run_hybrid_synthesis(self, messages, turn):
         """Hybrid: get the FULL LLM answer first so the chat shows the complete,
         stable text at once (no live updates), then render per-sentence TTS+FLOAT
         (pipelined) so the avatar starts speaking quickly. The displayed answer
@@ -424,7 +534,7 @@ class Pipeline:
             self.video_queue.put(None)
             self.state = "speaking"
 
-    def _run_batch_synthesis(self, messages, turn, is_greeting=False):
+    def _run_batch_synthesis(self, messages, turn):
         """Batch mode: get the FULL LLM answer first, show it at once, then do a
         SINGLE TTS + FLOAT render. The chat no longer updates live and the avatar
         plays one continuous clip instead of changing per sentence.
@@ -462,7 +572,7 @@ class Pipeline:
         self.state = "speaking"
         self.video_queue.put(None)
 
-    def _run_pipelined_synthesis(self, messages, turn, is_greeting=False):
+    def _run_pipelined_synthesis(self, messages, turn):
         """Pipelined LLM → TTS → FLOAT: overlap TTS(N+1) with FLOAT(N)."""
         full_response = ""
         pending_tts_future = None  # Future for TTS of next sentence
@@ -575,6 +685,7 @@ class Pipeline:
         self.cancel_event.clear()
         self.chat_history.clear()
         self.patient.clear()
+        self.awaiting_consent = False
         self._pending_assistant_text = ""
         self._played_sentences = []
         while not self.video_queue.empty():

@@ -114,6 +114,10 @@ class FloatGPUPool:
 
         # Try to acquire any GPU
         while True:
+            # Bail out promptly on server shutdown so Ctrl+C isn't blocked waiting
+            # here for a free GPU (the caller treats None as a failed render).
+            if config.SHUTTING_DOWN.is_set():
+                return None
             for gpu_id in self.gpu_ids:
                 if self.semaphores[gpu_id].acquire(blocking=False):
                     try:
