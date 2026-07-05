@@ -243,13 +243,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     };
   }
 
-  function handleStateMessage(msg) {
-    // Update chat history
-    if (msg.chat_history) {
-      renderChat(msg.chat_history);
-    }
+  let chatState = [];   // [{role, content}] mirror of the server-side chat
 
-    if (msg.type === 'video') {
+  function handleStateMessage(msg) {
+    if (msg.type === 'chat') {
+      applyChatDelta(msg);
+    } else if (msg.type === 'video') {
       enqueueVideo(msg.video_url, msg.subtitle || '');
       statusBar.textContent = 'Speaking: ' + (msg.subtitle || '').slice(0, 60);
     } else if (msg.type === 'video_end') {
@@ -269,24 +268,41 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
       else if (s === 'speaking') { /* keep current subtitle status */ }
       else statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
     } else if (msg.type === 'reset') {
+      chatState = [];
+      chatMessages.innerHTML = '';
       interruptPlayback();
       statusBar.textContent = 'Click Start to begin';
     }
   }
 
-  function renderChat(history) {
-    chatMessages.innerHTML = '';
-    for (const m of history) {
-      const div = document.createElement('div');
-      div.className = 'msg ' + m.role;
-      const roleDiv = document.createElement('div');
-      roleDiv.className = 'role';
-      roleDiv.textContent = m.role === 'user' ? 'You' : 'Assistant';
-      div.appendChild(roleDiv);
-      div.appendChild(document.createTextNode(m.content));
-      chatMessages.appendChild(div);
+  function makeMsgNode(m) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + m.role;
+    const roleDiv = document.createElement('div');
+    roleDiv.className = 'role';
+    roleDiv.textContent = m.role === 'user' ? 'You' : 'Assistant';
+    div.appendChild(roleDiv);
+    div.appendChild(document.createTextNode(m.content));
+    return div;
+  }
+
+  // Apply an incremental chat update. The server sends only the changed suffix
+  // (msg.from = first changed index, msg.msgs = messages from there on), so we
+  // rebuild just the tail instead of the whole list — no full-DOM churn, no
+  // flicker, and scrollback is preserved unless the user is already at the bottom.
+  function applyChatDelta(msg) {
+    const from = msg.from | 0;
+    const atBottom = chatMessages.scrollTop + chatMessages.clientHeight
+                     >= chatMessages.scrollHeight - 40;
+    chatState.length = from;
+    for (const m of (msg.msgs || [])) chatState.push(m);
+    while (chatMessages.children.length > from) {
+      chatMessages.removeChild(chatMessages.lastChild);
     }
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+    for (let i = from; i < chatState.length; i++) {
+      chatMessages.appendChild(makeMsgNode(chatState[i]));
+    }
+    if (atBottom) chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
   connectStateWS();

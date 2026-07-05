@@ -42,7 +42,10 @@ class Session:
         self.state_clients: set[WebSocket] = set()
         # state_poller bookkeeping (per session)
         self.last_state = None
-        self.last_chat_sig = None
+        # (role, content) snapshot of the chat last pushed to this session's
+        # clients, so the poller sends only the CHANGED suffix each tick instead of
+        # re-serializing the whole history.
+        self.sent_chat: list = []
         self.empty_since = None  # wall-clock when state_clients last dropped to 0
 
 
@@ -96,6 +99,11 @@ async def api_toggle(request: Request):
     session.mic_enabled = not session.mic_enabled
     status = "on" if session.mic_enabled else "off"
     logger.info(f"Mic toggled: {status}")
+    # Counselor leads: when the mic is first enabled for a fresh conversation,
+    # have the avatar greet and ask the opening question instead of waiting for
+    # the user to speak first (drives the SBIRT GREETING node).
+    if session.mic_enabled and not session.pipeline.chat_history:
+        session.pipeline.start_greeting()
     return JSONResponse({"mic": status})
 
 
@@ -103,6 +111,7 @@ async def api_reset(request: Request):
     session = await session_for(request)
     session.pipeline.reset()
     session.mic_enabled = False
+    session.sent_chat = []  # next delta re-pushes from scratch
     await broadcast(session.state_clients, {"type": "reset"})
     return JSONResponse({"status": "ok"})
 
@@ -213,6 +222,16 @@ async def ws_state(websocket: WebSocket):
     session.state_clients.add(websocket)
     session.empty_since = None
     logger.info(f"State WebSocket client connected (session clients: {len(session.state_clients)})")
+    # Bring this client fully up to date on connect (full chat + current state);
+    # every later push is just the changed suffix (delta) computed by the poller.
+    try:
+        chat = session.pipeline.get_chat_history()
+        await websocket.send_text(json.dumps(
+            {"type": "chat", "from": 0, "msgs": chat, "total": len(chat)}))
+        await websocket.send_text(json.dumps(
+            {"type": "state", "state": session.pipeline.state}))
+    except Exception:
+        pass
     try:
         # Keep connection alive; client doesn't send data
         while True:
@@ -260,7 +279,6 @@ async def _poll_session(session: Session):
         if item is False:
             await broadcast(clients, {
                 "type": "video_end",
-                "chat_history": pipeline.get_chat_history(),
                 "state": pipeline.state,
             })
             break
@@ -283,31 +301,53 @@ async def _poll_session(session: Session):
             "type": "video",
             "video_url": video_url,
             "subtitle": item["sentence"],
-            "chat_history": pipeline.get_chat_history(),
             "state": "speaking",
         })
 
-    # Broadcast state changes
+    # Broadcast state changes (chat is pushed separately as a delta below).
     current_state = pipeline.state
     if current_state != session.last_state:
         session.last_state = current_state
-        chat = pipeline.get_chat_history()
-        session.last_chat_sig = (len(chat), sum(len(m.get("content", "")) for m in chat))
         await broadcast(clients, {
             "type": "state",
             "state": current_state,
-            "chat_history": chat,
         })
 
-    # Push streamed text the moment it changes — independent of video. In
-    # stream_parallel mode the assistant's sentences land in chat_history as the
-    # LLM streams them, well before the first clip finishes rendering, so this
-    # makes the reply TEXT appear in ~1s instead of waiting for video.
-    chat = pipeline.get_chat_history()
-    sig = (len(chat), sum(len(m.get("content", "")) for m in chat))
-    if sig != session.last_chat_sig:
-        session.last_chat_sig = sig
-        await broadcast(clients, {"type": "chat", "chat_history": chat})
+    # Push only the CHANGED suffix of the chat (delta) — the assistant's streamed
+    # sentences land in chat_history well before the first clip renders, so the
+    # reply TEXT still appears in ~1s, but a long conversation is never
+    # re-serialized and re-sent in full every tick.
+    await _push_chat_delta(session)
+
+
+def _chat_delta(prev: list, chat: list):
+    """Return (from_index, new_snapshot) where `chat` first differs from the
+    already-sent `prev` snapshot. Messages are only appended, updated at the tail
+    (streaming), or truncated at the tail (rollback/reset), so the first differing
+    index onward is the minimal delta. Returns (None, None) if unchanged."""
+    cur = [(m["role"], m.get("content", "")) for m in chat]
+    i = 0
+    n = min(len(cur), len(prev))
+    while i < n and cur[i] == prev[i]:
+        i += 1
+    if i == len(cur) and len(cur) == len(prev):
+        return None, None
+    return i, cur
+
+
+async def _push_chat_delta(session: Session):
+    """Send only the changed suffix of this session's chat to its clients."""
+    chat = session.pipeline.get_chat_history()
+    i, cur = _chat_delta(session.sent_chat, chat)
+    if i is None:
+        return
+    session.sent_chat = cur
+    await broadcast(session.state_clients, {
+        "type": "chat",
+        "from": i,
+        "msgs": chat[i:],
+        "total": len(chat),
+    })
 
 
 async def state_poller():

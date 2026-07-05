@@ -39,13 +39,12 @@ SYNTHESIS_MODE = "stream_parallel"
 # change the data modules under modules/sbirt/ — not this string.
 SYSTEM_PROMPT = build_system_prompt()
 
-# Sentence splitting for synthesis: also break at commas / semicolons (not only
-# sentence-final punctuation) so the FIRST chunk is shorter and the avatar starts
-# talking sooner. A soft (comma) break only fires once the pending chunk is at
-# least MIN_CHUNK_CHARS long, to avoid tiny choppy fragments ("Well,"). Set
-# SPLIT_ON_COMMA=False to revert to sentence-only; MIN_CHUNK_CHARS=1 = every comma.
-SPLIT_ON_COMMA = True
-MIN_CHUNK_CHARS = 5
+# Sentence splitting for synthesis breaks ONLY on sentence-final punctuation, so
+# each spoken clip is a whole sentence (comma-level splitting was removed — it made
+# the avatar choppy, with a silence gap and lip-sync seam at every comma, and it
+# multiplied FLOAT renders). The system prompt's "open with a 4–8 word
+# acknowledgment as its own sentence" rule keeps the first clip short for a fast
+# start without needing sub-sentence splits.
 
 # TTS
 TTS_VOICE = "en-US-GuyNeural"

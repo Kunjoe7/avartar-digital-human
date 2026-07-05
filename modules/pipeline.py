@@ -22,6 +22,10 @@ class Pipeline:
         self.video_queue = queue.Queue()
         self.chat_history = []  # List of {"role": ..., "content": ...} (frontend display)
         self.llm_history = []   # Conversation sent to the LLM API (this session only)
+        # Structured patient profile (age, sex, substances, screening scores, ...),
+        # injected into the prompt every turn so it survives history-window trimming
+        # and the model never loses key clinical facts.
+        self.patient = {}
         self._lock = threading.Lock()
         self._processing_thread = None
         # Track which sentences were actually played
@@ -52,14 +56,10 @@ class Pipeline:
                     self.video_queue.get_nowait()
                 except queue.Empty:
                     break
-            # If we were mid-response, only keep what was played
-            if self._pending_assistant_text and self._played_sentences:
-                played = "".join(self._played_sentences)
-                # Update the last assistant message to only what was played
-                for i in range(len(self.chat_history) - 1, -1, -1):
-                    if self.chat_history[i]["role"] == "assistant":
-                        self.chat_history[i]["content"] = played
-                        break
+            # Histories are pipeline-owned and committed together by the in-flight
+            # producer's finally (whatever was generated so far lands in BOTH
+            # chat_history and llm_history), so the two stay consistent without any
+            # truncation here.
             self._pending_assistant_text = ""
             self._played_sentences = []
 
@@ -98,6 +98,93 @@ class Pipeline:
         )
         self._processing_thread.start()
 
+    # ---------- Proactive greeting (counselor leads the conversation) ----------
+    def start_greeting(self):
+        """Kick off the counselor's opening turn with NO user input, so the avatar
+        greets and asks the first SBIRT question instead of waiting to be spoken
+        to. Runs the same synthesis path as a normal turn."""
+        self._t0 = time.perf_counter()
+        self.state = "processing"
+        self.cancel_event.clear()
+        self._turn += 1
+        turn = self._turn
+        self._processing_thread = threading.Thread(
+            target=self._process_greeting, args=(turn,), daemon=True
+        )
+        self._processing_thread.start()
+
+    def _process_greeting(self, turn):
+        try:
+            if self._aborted(turn):
+                self.state = "idle"
+                return
+            self.state = "processing"
+            self._run_synthesis(self._greeting_messages(), turn, is_greeting=True)
+        except Exception as e:
+            logger.error(f"Greeting error: {e}", exc_info=True)
+            self.state = "idle"
+
+    def _greeting_messages(self):
+        """Messages for the opening turn. The SBIRT prompt already says to enter at
+        the GREETING node, so an ephemeral (non-persisted) kickoff is enough to make
+        the model open. Only the assistant greeting it produces is stored, so the
+        conversation history starts cleanly with the counselor's first line."""
+        kickoff = {"role": "user", "content":
+                   "[Session start. Greet the user in one short line and ask your "
+                   "opening question now — do not wait for them to speak first.]"}
+        return llm.build_messages(self.llm_history, dict(self.patient)) + [kickoff]
+
+    # ---------- Shared history management (both histories move together) ----------
+    # chat_history (frontend display) and llm_history (sent to the API) are kept in
+    # lockstep here so they can never diverge on barge-in or LLM errors. llm.py no
+    # longer mutates history at all — the Pipeline is the single owner.
+    def _history_begin(self, user_text):
+        """Append the user turn to BOTH histories and return the API message list.
+        If the previous turn's user message is still unanswered (e.g. speech split
+        by a pause into two segments, so the first half hasn't been replied to yet),
+        MERGE the new text into it — never drop it. This preserves everything the
+        user said, reassembles the paused sentence into one turn, and still avoids
+        sending two user messages in a row to the API."""
+        with self._lock:
+            for hist in (self.chat_history, self.llm_history):
+                if hist and hist[-1]["role"] == "user":
+                    hist[-1] = {"role": "user",
+                                "content": (hist[-1]["content"].rstrip()
+                                            + " " + user_text).strip()}
+                else:
+                    hist.append({"role": "user", "content": user_text})
+            llm._trim_history(self.llm_history)
+            messages = llm.build_messages(self.llm_history, dict(self.patient))
+            history_snapshot = list(self.llm_history)
+        # Fire-and-forget structured extraction to keep the patient profile current.
+        # Runs off the hot path (never blocks TTS/display) and applies to the NEXT
+        # turn's prompt, so age/sex/screening facts survive history-window trimming.
+        threading.Thread(target=self._extract_patient, args=(history_snapshot,),
+                         name="patient-extract", daemon=True).start()
+        return messages
+
+    def _extract_patient(self, history_snapshot):
+        """Merge any newly-extracted patient facts into the profile (background)."""
+        facts = llm.extract_patient_facts(history_snapshot)
+        if not facts:
+            return
+        with self._lock:
+            for k, v in facts.items():
+                if v in (None, "", [], {}):
+                    continue
+                self.patient[k] = v
+        logger.info("[patient] profile now: %s", self.patient)
+
+    def _history_set_assistant(self, text):
+        """Create or update the current assistant turn with the SAME text in both
+        histories, so display and API memory always agree."""
+        with self._lock:
+            for hist in (self.chat_history, self.llm_history):
+                if hist and hist[-1]["role"] == "assistant":
+                    hist[-1]["content"] = text
+                else:
+                    hist.append({"role": "assistant", "content": text})
+
     def _process_speech(self, audio_array, turn):
         """Full pipeline: ASR → LLM stream → TTS+FLOAT (pipelined) → video queue."""
         try:
@@ -118,11 +205,10 @@ class Pipeline:
                 self.state = "idle"
                 return
 
-            self.chat_history.append({"role": "user", "content": user_text})
-
-            # Step 2: LLM streaming → pipelined TTS+FLOAT
+            # Step 2: append the user turn to BOTH histories, then synthesize.
+            messages = self._history_begin(user_text)
             self.state = "processing"
-            self._run_synthesis(user_text, turn)
+            self._run_synthesis(messages, turn)
 
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
@@ -135,27 +221,29 @@ class Pipeline:
                 self.state = "idle"
                 return
 
-            self.chat_history.append({"role": "user", "content": user_text})
+            messages = self._history_begin(user_text)
             self.state = "processing"
-            self._run_synthesis(user_text, turn)
+            self._run_synthesis(messages, turn)
 
         except Exception as e:
             logger.error(f"Pipeline error (text): {e}", exc_info=True)
             self.state = "idle"
 
-    def _run_synthesis(self, user_text, turn):
-        """Dispatch to the configured synthesis mode."""
+    def _run_synthesis(self, messages, turn, is_greeting=False):
+        """Dispatch to the configured synthesis mode. `messages` is the full API
+        message list (system + history + current user, or the greeting kickoff)
+        built by the caller; the user turn is already in both histories."""
         mode = getattr(config, "SYNTHESIS_MODE", "stream_parallel")
         if mode == "batch":
-            self._run_batch_synthesis(user_text, turn)
+            self._run_batch_synthesis(messages, turn, is_greeting)
         elif mode == "stream":
-            self._run_pipelined_synthesis(user_text, turn)
+            self._run_pipelined_synthesis(messages, turn, is_greeting)
         elif mode == "hybrid":
-            self._run_hybrid_synthesis(user_text, turn)
+            self._run_hybrid_synthesis(messages, turn, is_greeting)
         else:
-            self._run_streaming_parallel_synthesis(user_text, turn)
+            self._run_streaming_parallel_synthesis(messages, turn, is_greeting)
 
-    def _run_streaming_parallel_synthesis(self, user_text, turn):
+    def _run_streaming_parallel_synthesis(self, messages, turn, is_greeting=False):
         """Fastest mode: stream sentences from the LLM (chat text appears live in
         <1s) AND render each sentence's TTS+FLOAT concurrently across the whole
         GPU pool, while enqueuing strictly in sentence order.
@@ -192,11 +280,10 @@ class Pipeline:
 
         def _producer(executor):
             """Pull sentences off the LLM stream, submit renders, update chat live."""
-            assistant_added = False
             full_response = ""
             try:
                 for idx, sentence in enumerate(
-                    llm.chat_stream(user_text, self.llm_history, cancel_event=self.cancel_event)
+                    llm.chat_stream(messages, cancel_event=self.cancel_event)
                 ):
                     if self._aborted(turn):
                         break
@@ -206,21 +293,21 @@ class Pipeline:
                     full_response += sentence
                     logger.info(f"LLM sentence: {sentence}")
 
-                    # Live chat update so the frontend shows text as it streams in.
-                    if not assistant_added:
-                        self.chat_history.append({"role": "assistant", "content": full_response})
-                        assistant_added = True
-                    else:
-                        for i in range(len(self.chat_history) - 1, -1, -1):
-                            if self.chat_history[i]["role"] == "assistant":
-                                self.chat_history[i]["content"] = full_response
-                                break
+                    # Live update BOTH histories so display and API memory agree.
+                    self._history_set_assistant(full_response)
 
                     futures_q.put((executor.submit(_render, sentence, idx), sentence))
-                self._pending_assistant_text = full_response
             except Exception:
                 logger.exception("streaming producer failed")
             finally:
+                # Finalize history only if we still own the turn. If superseded
+                # (barge-in, or a follow-on utterance after a pause), the newer turn
+                # now owns the histories — don't touch them here, and NEVER delete
+                # the user's message. A produced-nothing turn just leaves its user
+                # message, which the next turn merges into (see _history_begin).
+                if full_response.strip() and not self._aborted(turn):
+                    self._history_set_assistant(full_response)
+                    self._pending_assistant_text = full_response
                 futures_q.put(SENTINEL)
 
         first_seg = True
@@ -262,17 +349,14 @@ class Pipeline:
 
     @staticmethod
     def _split_sentences(text):
-        """Split a full response into chunks (same boundaries as the LLM streamer):
-        hard sentence-final punctuation always splits; commas/semicolons split too
-        once the pending chunk is at least MIN_CHUNK_CHARS long."""
-        hard = {"。", "！", "？", ".", "!", "?", "\n"}
-        soft = ({",", "，", "、", "；", ";"}
-                if getattr(config, "SPLIT_ON_COMMA", False) else set())
-        min_chars = getattr(config, "MIN_CHUNK_CHARS", 0)
+        """Split a full response into sentences (same boundaries as the LLM
+        streamer): only on sentence-final punctuation, so each spoken clip is a
+        whole sentence."""
+        endings = {"。", "！", "？", ".", "!", "?", "\n"}
         sentences, buf = [], ""
         for ch in text:
             buf += ch
-            if ch in hard or (ch in soft and len(buf.strip()) >= min_chars):
+            if ch in endings:
                 s = buf.strip()
                 if s:
                     sentences.append(s)
@@ -281,7 +365,7 @@ class Pipeline:
             sentences.append(buf.strip())
         return sentences
 
-    def _run_hybrid_synthesis(self, user_text, turn):
+    def _run_hybrid_synthesis(self, messages, turn, is_greeting=False):
         """Hybrid: get the FULL LLM answer first so the chat shows the complete,
         stable text at once (no live updates), then render per-sentence TTS+FLOAT
         (pipelined) so the avatar starts speaking quickly. The displayed answer
@@ -292,14 +376,15 @@ class Pipeline:
             return
 
         # 1. Full answer in one shot (no live, sentence-by-sentence chat updates).
-        full_response = (llm.chat(user_text, self.llm_history) or "").strip()
+        full_response = (llm.chat(messages) or "").strip()
         logger.info(f"LLM full response: {full_response}")
         if not full_response or self._aborted(turn):
+            # Nothing to commit; leave the user message (merged by the next turn).
             self.state = "idle"
             return
 
-        # 2. Show the complete answer at once as one stable chat entry.
-        self.chat_history.append({"role": "assistant", "content": full_response})
+        # 2. Commit the complete answer to BOTH histories (one stable chat entry).
+        self._history_set_assistant(full_response)
         self._pending_assistant_text = full_response
 
         # 3. Render sentences CONCURRENTLY across the FLOAT GPU pool, but enqueue
@@ -339,7 +424,7 @@ class Pipeline:
             self.video_queue.put(None)
             self.state = "speaking"
 
-    def _run_batch_synthesis(self, user_text, turn):
+    def _run_batch_synthesis(self, messages, turn, is_greeting=False):
         """Batch mode: get the FULL LLM answer first, show it at once, then do a
         SINGLE TTS + FLOAT render. The chat no longer updates live and the avatar
         plays one continuous clip instead of changing per sentence.
@@ -349,14 +434,15 @@ class Pipeline:
             return
 
         # 1. Full answer in one shot (no live, sentence-by-sentence updates).
-        full_response = (llm.chat(user_text, self.llm_history) or "").strip()
+        full_response = (llm.chat(messages) or "").strip()
         logger.info(f"LLM full response: {full_response}")
         if not full_response or self._aborted(turn):
+            # Nothing to commit; leave the user message (merged by the next turn).
             self.state = "idle"
             return
 
-        # 2. Show the complete answer immediately as one stable chat entry.
-        self.chat_history.append({"role": "assistant", "content": full_response})
+        # 2. Commit the complete answer to BOTH histories (one stable chat entry).
+        self._history_set_assistant(full_response)
         self._pending_assistant_text = full_response
 
         # 3. One TTS for the whole answer.
@@ -376,31 +462,22 @@ class Pipeline:
         self.state = "speaking"
         self.video_queue.put(None)
 
-    def _run_pipelined_synthesis(self, user_text, turn):
+    def _run_pipelined_synthesis(self, messages, turn, is_greeting=False):
         """Pipelined LLM → TTS → FLOAT: overlap TTS(N+1) with FLOAT(N)."""
         full_response = ""
         pending_tts_future = None  # Future for TTS of next sentence
         pending_tts_sentence = None
-        assistant_entry_added = False
 
         with ThreadPoolExecutor(max_workers=1) as tts_executor:
-            for sentence in llm.chat_stream(user_text, self.llm_history, cancel_event=self.cancel_event):
+            for sentence in llm.chat_stream(messages, cancel_event=self.cancel_event):
                 if self._aborted(turn):
                     break
 
                 full_response += sentence
                 logger.info(f"LLM sentence: {sentence}")
 
-                # Progressively update chat history so frontend sees partial response
-                if not assistant_entry_added:
-                    self.chat_history.append({"role": "assistant", "content": full_response})
-                    assistant_entry_added = True
-                else:
-                    # Update the last assistant entry in-place
-                    for i in range(len(self.chat_history) - 1, -1, -1):
-                        if self.chat_history[i]["role"] == "assistant":
-                            self.chat_history[i]["content"] = full_response
-                            break
+                # Progressively update BOTH histories so display and API memory agree.
+                self._history_set_assistant(full_response)
 
                 if self._aborted(turn):
                     break
@@ -453,20 +530,12 @@ class Pipeline:
                         })
                         self.state = "speaking"
 
-        # Finalize chat history (already added progressively, just ensure it's complete)
-        if full_response and not self._aborted(turn):
+        # Finalize history only if we still own the turn; never delete the user's
+        # message (a produced-nothing turn is merged by the next turn).
+        if full_response.strip() and not self._aborted(turn):
+            self._history_set_assistant(full_response)
             self._pending_assistant_text = full_response
-            # Update final content in case last sentence wasn't captured
-            if assistant_entry_added:
-                for i in range(len(self.chat_history) - 1, -1, -1):
-                    if self.chat_history[i]["role"] == "assistant":
-                        self.chat_history[i]["content"] = full_response
-                        break
-            else:
-                self.chat_history.append({"role": "assistant", "content": full_response})
             self.video_queue.put(None)
-        elif full_response and not assistant_entry_added:
-            self.chat_history.append({"role": "assistant", "content": full_response})
 
         if not self._aborted(turn):
             self.state = "speaking"
@@ -505,6 +574,7 @@ class Pipeline:
         time.sleep(0.1)
         self.cancel_event.clear()
         self.chat_history.clear()
+        self.patient.clear()
         self._pending_assistant_text = ""
         self._played_sentences = []
         while not self.video_queue.empty():

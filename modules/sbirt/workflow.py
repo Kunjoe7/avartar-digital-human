@@ -30,8 +30,11 @@ class Node:
 NODES = (
     Node(
         "GREETING",
-        "Open warmly, set the frame (brief, confidential check-in), get consent to talk.",
-        "Introduce yourself in one line and ask an open opening question.",
+        "Open warmly, set the frame (a brief, low-pressure check-in), find out the "
+        "person's age (and sex if it comes up naturally) so the right tools are "
+        "used, and get consent to talk.",
+        "Introduce yourself in one line and ask an open opening question; early on, "
+        "establish their age naturally — it decides adult tools vs CRAFFT (≤21).",
         ("user engages → PRE_SCREEN",
          "user declines → CLOSE (respect autonomy)",
          "crisis cue at any point → CRISIS"),
