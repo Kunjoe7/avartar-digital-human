@@ -167,3 +167,46 @@ def test_prescreen_structure():
     assert [q.key for q in PRE_SCREEN] == ["tobacco", "alcohol", "drugs"]
     for q in PRE_SCREEN:
         assert {o.score for o in q.item.options} == {0, 1}
+
+
+# --------- T1: the data-model migration (skip rules as declarative data) ---------
+
+def test_audit_skip_rules_are_declarative_data():
+    """AUDIT's two WHO Box-4 skip rules live ON the instrument as data; the
+    engine (_skipped_items/next_item_index) has no per-instrument branches."""
+    assert len(AUDIT.skip_rules) == 2
+    assert DAST_10.skip_rules == ()
+    # Rule 1: item 1 'Never' skips 2-8.
+    assert AUDIT.skip_rules[0].skip == tuple(range(1, 8))
+    assert AUDIT.skip_rules[0].when({0: 0}) is True
+    assert AUDIT.skip_rules[0].when({0: 1}) is False
+    assert AUDIT.skip_rules[0].when({}) is False          # unanswered → no skip
+    # Rule 2: items 2+3 totalling 0 skips 4-8 — and only when BOTH answered.
+    assert AUDIT.skip_rules[1].skip == tuple(range(3, 8))
+    assert AUDIT.skip_rules[1].when({1: 0, 2: 0}) is True
+    assert AUDIT.skip_rules[1].when({1: 0}) is False
+    assert AUDIT.skip_rules[1].when({1: 1, 2: 0}) is False
+
+
+def test_item_kind_derived_from_options():
+    """kind can never drift from the options it is derived from."""
+    assert DAST_10.items[0].kind == "yesno"
+    assert AUDIT.items[0].kind == "scale"
+    assert AUDIT.items[8].kind == "scale"     # No/Yes-timeframed is NOT yesno
+    assert PRE_SCREEN[0].item.kind == "yesno"
+
+
+def test_stems_verbatim_by_default():
+    """Conservative default pending the study's exact-wording ruling: every
+    administered stem is spoken verbatim; the engine may wrap, never rephrase."""
+    for ins in (AUDIT, DAST_10):
+        assert all(it.verbatim for it in ins.items)
+    assert all(q.item.verbatim for q in PRE_SCREEN)
+
+
+def test_option_aliases_ship_empty():
+    """Aliases are a clinical coding decision (PENDING CLINICIAN REVIEW) —
+    the field exists as a contract but must ship empty until reviewed."""
+    for ins in (AUDIT, DAST_10):
+        for it in ins.items:
+            assert all(o.aliases == () for o in it.options)

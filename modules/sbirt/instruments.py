@@ -27,15 +27,22 @@ Screen / NM ASSIST; TAPS tool; Knight CRAFFT 2.1.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 @dataclass(frozen=True)
 class Option:
-    """One answer choice: exact wording + the points it contributes."""
+    """One answer choice: exact wording + the points it contributes.
+
+    `aliases` are EXACT spoken equivalents (matched lowercased, whole-answer)
+    for deterministic pre-matching only — never fuzzy. Populating them is a
+    clinical coding decision (PENDING CLINICIAN REVIEW), so they ship empty;
+    semantic mapping stays with the never-guess LLM coder.
+    """
 
     label: str
     score: int
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,11 +52,41 @@ class Item:
     A recorded response is the option's INDEX in `options` (its "code");
     the contributed score is `options[code].score`. For most items code ==
     score, but e.g. AUDIT items 9-10 score 0/2/4 for codes 0/1/2.
+
+    `verbatim=True` (the conservative default, pending the study's ruling on
+    exact-wording requirements) means the stem is SPOKEN exactly as written;
+    the conversational engine may add acknowledgment around it but never
+    rephrase it. Open/number questions that are protocol conversation (not
+    instrument items) live in the flow layer, not here.
     """
 
     text: str
     options: tuple[Option, ...]
     note: str = ""  # skip rule / scoring deviation, rendered with the item
+    verbatim: bool = True
+
+    @property
+    def kind(self) -> str:
+        """Presentation hint for the NLU/ask layer: "yesno" | "scale".
+        Derived from the options so it can never drift from them."""
+        labels = tuple(o.label.lower() for o in self.options)
+        return "yesno" if labels == ("no", "yes") else "scale"
+
+
+@dataclass(frozen=True)
+class SkipRule:
+    """Declarative skip logic: when `when(scores)` is true, every item index
+    in `skip` is never asked and contributes 0 (official-form behavior).
+
+    `scores` maps answered item index -> CONTRIBUTED SCORE (never the raw
+    option code), so instruments where code != score (AUDIT items 9-10)
+    can never confuse a predicate. Adding a skip rule = adding data here;
+    the engine (`next_item_index`) needs no changes.
+    """
+
+    skip: tuple[int, ...]
+    when: Callable[[Mapping[int, int]], bool]
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -82,6 +119,7 @@ class Instrument:
     scoring: str
     bands: tuple[RiskBand, ...]
     preamble: str = ""     # spoken once before item 1 (from the study protocol)
+    skip_rules: tuple[SkipRule, ...] = ()   # declarative skip logic (see SkipRule)
 
     def render(self) -> str:
         lines = [f"### {self.name}  ({self.domain}, {len(self.items)} items)",
@@ -244,6 +282,15 @@ AUDIT = Instrument(
     ),
     response_scale="Items 1–8: 0–4; items 9–10: 0/2/4",
     scoring="Sum all items (0–40). Zones per WHO manual.",
+    # WHO AUDIT Box 4 skip rules as data (predicates read contributed SCORES):
+    skip_rules=(
+        SkipRule(skip=tuple(range(1, 8)),
+                 when=lambda s: s.get(0) == 0,
+                 note="item 1 'Never' → skip items 2–8, go to items 9–10"),
+        SkipRule(skip=tuple(range(3, 8)),
+                 when=lambda s: 1 in s and 2 in s and s[1] + s[2] == 0,
+                 note="items 2+3 total 0 → skip items 4–8, go to items 9–10"),
+    ),
     bands=(
         RiskBand("Zone I – Low risk (Healthy)", 0, 7,
                  "Alcohol education / affirmation", zone="healthy"),
@@ -387,15 +434,10 @@ def render_catalog() -> str:
 #
 # A response set is {item_index: option_code} (both 0-based); the code is
 # the option's index in Item.options and its score is options[code].score
-# (AUDIT items 9-10: codes 0/1/2 score 0/2/4). WHO AUDIT Box 4 skip rules:
-#   item 1 == Never (0)      -> skip items 2-8, go to items 9-10
-#   items 2+3 total 0        -> skip items 4-8, go to items 9-10
-# Skipped items contribute 0, per the official form.
+# (AUDIT items 9-10: codes 0/1/2 score 0/2/4). Skip logic lives on each
+# instrument as declarative SkipRule data (see AUDIT.skip_rules); skipped
+# items contribute 0, per the official form.
 # =====================================================================
-
-# AUDIT skip rules reference items by 0-based index.
-_AUDIT_Q1, _AUDIT_Q2, _AUDIT_Q3 = 0, 1, 2
-_AUDIT_SKIP_TO = 8  # items 9-10 (0-based 8-9)
 
 
 class InvalidResponse(ValueError):
@@ -429,19 +471,17 @@ def option_score(instrument: Instrument, item_index: int, code: int) -> int:
 
 def _skipped_items(instrument: Instrument,
                    responses: Mapping[int, int]) -> frozenset[int]:
-    """Item indexes that the official skip rules remove, given answers so far."""
-    if instrument.key != "audit":
+    """Item indexes removed by the instrument's declarative skip_rules, given
+    answers so far. Rules read contributed SCORES (never raw codes), so the
+    generalization is safe for instruments where code != score."""
+    if not instrument.skip_rules:
         return frozenset()
+    scores = {i: option_score(instrument, i, code)
+              for i, code in responses.items()}
     skipped: set[int] = set()
-    q1 = responses.get(_AUDIT_Q1)
-    if q1 is not None and option_score(instrument, _AUDIT_Q1, q1) == 0:
-        skipped.update(range(_AUDIT_Q2, _AUDIT_SKIP_TO))       # skip 2–8
-    q2, q3 = responses.get(_AUDIT_Q2), responses.get(_AUDIT_Q3)
-    if q2 is not None and q3 is not None:
-        total_23 = (option_score(instrument, _AUDIT_Q2, q2)
-                    + option_score(instrument, _AUDIT_Q3, q3))
-        if total_23 == 0:
-            skipped.update(range(_AUDIT_Q3 + 1, _AUDIT_SKIP_TO))  # skip 4–8
+    for rule in instrument.skip_rules:
+        if rule.when(scores):
+            skipped.update(rule.skip)
     return frozenset(skipped)
 
 
