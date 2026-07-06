@@ -1,15 +1,31 @@
-# Digital Human Chatbot
+# Digital Human SBIRT Screener
 
-Real-time digital human dialogue system: browser mic capture → VAD segmentation → ASR → streaming LLM → sentence-level TTS → FLOAT talking-head synthesis → video stream playback. Supports user barge-in (interrupting the avatar mid-response).
+Real-time digital human for SBIRT alcohol/drug screening: browser mic capture
+→ VAD segmentation (+ smart-turn EOU) → ASR → **deterministic clinical state
+machine** → cached fixed clips / bounded LLM utterances → FLOAT talking-head
+video. Supports user barge-in (interrupting the avatar mid-response).
 
 ## Architecture
 
 ```
-Browser mic ─WS(17862)─▶ VAD ─speech_end─▶ Pipeline
-Pipeline: ASR ─▶ LLM(stream) ─▶ split into sentences ─▶ TTS ─▶ FLOAT ─▶ video queue
+Browser mic ─WS /ws/audio─▶ VAD(+EOU) ─speech_end─▶ Pipeline
+Pipeline: ASR ─▶ crisis net (deterministic) ─▶ NLU coder (option/number/consent)
+          ─▶ clinical state machine (modules/sbirt/runtime.py)
+          ─▶ fixed utterances: pre-rendered cached clips (assets/clips/)
+             LLM utterances: bounded single-sentence phrasing ─▶ TTS ─▶ FLOAT
 WS(/ws/state) pushes the next video segment and subtitle to the frontend
-Barge-in: VAD speech_start ─▶ cancel_event ─▶ clear queue
+Barge-in: VAD/ASR speech_start ─▶ cancel_event + turn bump ─▶ clear queue
 ```
+
+**Deterministic clinical core** (`modules/sbirt/`): AUDIT/DAST scores, risk
+zones, question order/skip rules, arm routing and zone feedback are computed
+by code (`instruments.py` + `runtime.py` + `templates.py`),
+never by the LLM. The LLM's jobs are narrow: coding free-text answers onto
+option codes (with AMBIGUOUS → clarification, never guessing), and phrasing
+single bounded utterances (reflections/summaries). A deterministic crisis
+keyword net (`crisis.py`) runs before everything and cannot be down. Consent
+decisions land in an append-only audit log (`records/`). See
+`DECISIONS_FOR_REVIEW.md` for open clinical/compliance decision points.
 
 Server: Starlette + uvicorn (single port 17861, HTTP + two WebSocket routes).
 Frontend: `static/index.html`, plain HTML/JS, no build step.
@@ -18,27 +34,34 @@ Frontend: `static/index.html`, plain HTML/JS, no build step.
 
 ```
 digital-human/
-├── main.py                  # Starlette entrypoint (HTTP + WS)
+├── main.py                  # Starlette entrypoint (HTTP + WS), per-sid sessions
 ├── config.py                # All configuration (GPU allocation, models, prompt, ...)
+├── DECISIONS_FOR_REVIEW.md  # Open clinical/compliance decision points
 ├── modules/
-│   ├── pipeline.py          # Orchestration: ASR → LLM → TTS → FLOAT, with barge-in
+│   ├── pipeline.py          # Orchestration: ASR → coder → machine → clips/TTS/FLOAT
 │   ├── vad.py               # Silero VAD real-time segmentation
-│   ├── asr.py               # FunASR (SenseVoiceSmall) on GPU 3
-│   ├── llm.py               # OpenRouter (gemini-2.5-flash) streaming
+│   ├── eou.py               # smart-turn v3 semantic end-of-utterance (CPU ONNX)
+│   ├── asr.py               # FunASR (SenseVoiceSmall)
+│   ├── llm.py               # OpenRouter: NLU coding + bounded utterances (+ crisis chat)
 │   ├── tts.py               # edge-tts (en-US-GuyNeural)
-│   ├── avatar.py            # FLOAT multi-GPU pool (0/1/2) + idle video
-│   ├── audio_server.py      # Browser audio WS handler
-│   └── sbirt/               # SBIRT clinical framework (data-driven, config-free)
-│       ├── instruments.py   #   validated screening tools (AUDIT, DAST-10, CAGE-AID, CRAFFT, ...)
-│       ├── intervention.py  #   MI/OARS, FRAMES, stages of change, readiness rulers
-│       ├── referral.py      #   ASAM levels of care, MAT, resources, crisis protocol
-│       ├── workflow.py      #   the SBIRT conversation state machine
-│       └── prompt.py        #   build_system_prompt(): renders ALL of the above into the prompt
+│   ├── avatar.py            # FLOAT GPU pool + idle video
+│   ├── privacy.py           # PHI-safe logging (no opt-out) + consent audit trail
+│   └── sbirt/               # SBIRT clinical framework — the deterministic core
+│       ├── instruments.py   #   structured tools + deterministic scoring in one file
+│       ├── runtime.py       #   the executable clinical state machine
+│       ├── templates.py     #   versioned verbatim script (questions/feedback/BI)
+│       ├── crisis.py        #   deterministic crisis keyword net + fixed responses
+│       ├── intervention.py  #   MI/OARS, FRAMES, stages of change (prompt data)
+│       ├── referral.py      #   ASAM levels, MAT, resources, crisis protocol (prompt data)
+│       ├── workflow.py      #   conceptual SBIRT node map (prompt data)
+│       └── prompt.py        #   build_system_prompt() — now used for crisis turns
+├── tests/                   # pytest: gold-standard case cards + integration
 ├── static/
 │   ├── index.html           # Frontend UI
 │   └── test_audio.html      # Mic / ASR debug page
 ├── assets/
 │   ├── avatar.png           # Avatar portrait (FLOAT input)
+│   ├── clips/               # Pre-rendered fixed protocol clips (auto-generated)
 │   └── idle_loop.mp4        # Idle loop video (auto-generated on first run)
 └── requirements.txt
 ```
@@ -68,15 +91,33 @@ All other settings live in `config.py`. Common knobs:
 
 | Setting | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `google/gemini-2.5-flash` | OpenRouter model |
+| `LLM_MODEL` | `google/gemini-2.5-flash` | OpenRouter model (NLU coding + bounded utterances) |
 | `TTS_VOICE` | `en-US-GuyNeural` | edge-tts voice |
 | `ASR_MODEL` | `iic/SenseVoiceSmall` | FunASR model |
-| `FLOAT_GPUS` | `[0, 1, 2]` | GPUs used by FLOAT in parallel |
-| `ASR_GPU` | `3` | Dedicated GPU for ASR |
+| `FLOAT_GPUS` | `[2]` | GPUs used by FLOAT (list; parallel across entries) |
+| `ASR_GPU` | `2` | GPU for ASR (currently shared with FLOAT) |
 | `FLOAT_NFE` | `10` | FLOAT inference steps (lower = faster) |
 | `VAD_THRESHOLD` | `0.5` | Silero VAD trigger threshold |
-| `VAD_SILENCE_DURATION` | `0.5` | Seconds of silence to mark sentence end |
-| `SYSTEM_PROMPT` | built from `modules/sbirt/` | SBIRT counselor prompt — **do not edit the string**; edit the clinical data modules under `modules/sbirt/` and it rebuilds automatically |
+| `VAD_SILENCE_DURATION` | `0.35` | Seconds of silence to mark sentence end |
+| `CONSENT_LOG_PATH` | `records/consent_log.jsonl` | Consent audit trail |
+| `SYSTEM_PROMPT` | built from `modules/sbirt/` | Crisis-turn counselor prompt — **do not edit the string**; edit the clinical data modules under `modules/sbirt/` and it rebuilds automatically |
+
+Clinical content (questions, options, scores, zones, feedback wording) lives in
+`modules/sbirt/instruments.py` + `templates.py`, sourced verbatim from the
+study documents in `SBIRT_Reference/`. Changing any fixed text bumps the clip
+cache automatically (sidecar text check) — bump `templates.SCRIPT_VERSION` too.
+
+## Tests
+
+```bash
+# Deterministic core (no GPU/network needed):
+python -m pytest tests/ -q
+# Full suite incl. real-Pipeline integration (needs the float env's deps):
+~/.conda/envs/float/bin/python -m pytest tests/ -q
+```
+
+Gold-standard fixtures under `tests/fixtures/` are hand-scored from the case
+cards in `SBIRT_Reference/` — fix code, never fixtures.
 
 ## Running
 

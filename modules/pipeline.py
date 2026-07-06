@@ -7,10 +7,33 @@ import queue
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 
+import re
 import config
-from modules import asr, llm, tts, avatar
+from modules import asr, llm, tts, avatar, privacy
+from modules.privacy import phi, phi_keys
+from modules.sbirt import crisis, runtime
+from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
 
 logger = logging.getLogger(__name__)
+
+# Read the root from config (single source of truth) — never reverse-derive it
+# from a file path like dirname(GREETING_VIDEO_PATH): that breaks the instant the
+# clip moves into a subdirectory.
+_CLIPS_DIR = config.CLIPS_DIR
+
+
+def crisis_clip_path(category: str) -> str:
+    """Cached clip location for one crisis category's fixed response."""
+    return os.path.join(_CLIPS_DIR, f"crisis_{category}.mp4")
+
+
+_KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def protocol_clip_path(key: str) -> str:
+    """Cached clip location for a fixed protocol utterance (runtime.Say key).
+    Content-addressed by the stable key, shared across ALL sessions."""
+    return os.path.join(_CLIPS_DIR, _KEY_SAFE.sub("_", key) + ".mp4")
 
 _fixed_clip_lock = threading.Lock()
 
@@ -51,37 +74,56 @@ def ensure_fixed_clip(text, path):
 
 
 def prewarm_fixed_clips():
-    """Pre-render the fixed greeting + decline clips once (called at startup warmup)
-    so both play instantly on first use."""
+    """Pre-render every fixed clip once (startup warmup): greeting, decline,
+    crisis responses, and ALL protocol utterances (questions, education,
+    zone feedback, BI lines incl. the 11 ruler variants). First boot renders
+    them one time; afterwards the sidecar text check makes this a no-op, and
+    at runtime the protocol costs ZERO FLOAT renders for fixed content."""
+    from modules.sbirt import templates
     ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
     ensure_fixed_clip(config.DECLINE_TEXT, config.DECLINE_VIDEO_PATH)
+    for category, text in crisis.RESPONSES.items():
+        if config.SHUTTING_DOWN.is_set():
+            return
+        ensure_fixed_clip(text, crisis_clip_path(category))
+    for key, text in templates.all_fixed_utterances().items():
+        if config.SHUTTING_DOWN.is_set():
+            return
+        ensure_fixed_clip(text, protocol_clip_path(key))
 
 
 class Pipeline:
     """State machine: idle → listening → processing → speaking → idle"""
 
-    def __init__(self):
+    def __init__(self, audit_key: str = "default"):
+        self.audit_key = audit_key  # pseudonymous session id for audit records
         self.state = "idle"  # idle, listening, processing, speaking
         self.cancel_event = threading.Event()
         self.video_queue = queue.Queue()
-        self.chat_history = []  # List of {"role": ..., "content": ...} (frontend display)
-        self.llm_history = []   # Conversation sent to the LLM API (this session only)
+        # THE conversation record: {"role", "content"} dicts. The frontend
+        # shows all of it; the LLM API gets a derived sliding-window suffix
+        # (_api_window). Deterministic scores live in self.clinical, so window
+        # trimming can never corrupt triage.
+        self.chat_history = []
         # Structured patient profile (age, sex, substances, screening scores, ...),
         # injected into the prompt every turn so it survives history-window trimming
         # and the model never loses key clinical facts.
         self.patient = {}
-        # True from when the fixed greeting is delivered until the user's consent
-        # reply is handled — that one turn is routed through classify_consent so a
-        # "no" gets the fixed decline clip instead of the full LLM.
-        self.awaiting_consent = False
         # Set when the user declines consent: the server then turns the mic off and
         # tells the client to stop, ending the session until Start is pressed again.
         self.ended = False
+        # THE clinical state: protocol node, coded answers, deterministic
+        # scores/zones, readiness. The machine (modules/sbirt/runtime.py)
+        # decides every transition; the LLM never does.
+        self.clinical = runtime.ClinicalSession()
+        runtime.start(self.clinical)
         self._lock = threading.Lock()
+        # Serializes protocol turns: coding -> machine advance -> delivery.
+        # Two concurrent turns (voice + typed, or a barge-in racing a slow
+        # coder) must never both advance the clinical machine; the stale turn
+        # re-checks _aborted() under this lock and drops out.
+        self._protocol_lock = threading.Lock()
         self._processing_thread = None
-        # Track which sentences were actually played
-        self._pending_assistant_text = ""
-        self._played_sentences = []
         # Monotonic turn id: each new utterance bumps it. A response only touches
         # shared state (enqueue video) while it still owns the current turn, so a
         # barged-in response can't leak stale segments into the next turn even
@@ -96,7 +138,7 @@ class Pipeline:
         return self.cancel_event.is_set() or turn != self._turn
 
     def on_speech_start(self):
-        """Called by audio_server when user starts speaking (barge-in)."""
+        """Called by main.ws_audio when user starts speaking (barge-in)."""
         if self.state in ("processing", "speaking"):
             logger.info("Barge-in detected! Cancelling current response.")
             self.cancel_event.set()
@@ -107,12 +149,8 @@ class Pipeline:
                     self.video_queue.get_nowait()
                 except queue.Empty:
                     break
-            # Histories are pipeline-owned and committed together by the in-flight
-            # producer's finally (whatever was generated so far lands in BOTH
-            # chat_history and llm_history), so the two stay consistent without any
-            # truncation here.
-            self._pending_assistant_text = ""
-            self._played_sentences = []
+            # History is pipeline-owned; the in-flight producer's finally commits
+            # whatever was generated so far, so no truncation is needed here.
 
         self.state = "listening"
 
@@ -130,14 +168,12 @@ class Pipeline:
         self.state = "idle"
 
     def on_speech_end(self, audio_array):
-        """Called by audio_server when user finishes speaking.
+        """Called by main.ws_audio when user finishes speaking.
         audio_array: float32 numpy array at 16kHz.
         """
         self._t0 = time.perf_counter()
         self.state = "processing"
         self.cancel_event.clear()
-        self._pending_assistant_text = ""
-        self._played_sentences = []
         self._turn += 1
         turn = self._turn
 
@@ -152,8 +188,6 @@ class Pipeline:
         self._t0 = time.perf_counter()
         self.state = "processing"
         self.cancel_event.clear()
-        self._pending_assistant_text = ""
-        self._played_sentences = []
         self._turn += 1
         turn = self._turn
 
@@ -189,8 +223,9 @@ class Pipeline:
             video = ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
             # Record the fixed opening as the assistant's first turn in both histories.
             self._history_set_assistant(text)
-            # The next user turn is the consent answer — route it through the gate.
-            self.awaiting_consent = True
+            # Fresh protocol run: the machine starts at the consent expectation.
+            self.clinical = runtime.ClinicalSession()
+            runtime.start(self.clinical)
             if video and not self._aborted(turn):
                 self.video_queue.put({
                     "video": video,
@@ -209,7 +244,7 @@ class Pipeline:
     def _deliver_decline(self, user_text, turn):
         """User declined consent: record their reply + the FIXED thank-you line, play
         the cached decline clip, and end the turn. No screening, no dynamic LLM."""
-        self._history_begin(user_text)          # record the user's "no" in both histories
+        self._history_begin(user_text)          # record the user's "no"
         text = config.DECLINE_TEXT
         video = ensure_fixed_clip(text, config.DECLINE_VIDEO_PATH)
         self._history_set_assistant(text)
@@ -227,32 +262,77 @@ class Pipeline:
         # client to stop) now that the goodbye clip is queued for delivery.
         self.ended = True
 
-    # ---------- Shared history management (both histories move together) ----------
-    # chat_history (frontend display) and llm_history (sent to the API) are kept in
-    # lockstep here so they can never diverge on barge-in or LLM errors. llm.py no
-    # longer mutates history at all — the Pipeline is the single owner.
+    def _deliver_crisis(self, user_text, hit, turn):
+        """Deterministic crisis net fired: speak the FIXED response for the
+        category from its cached clip — no LLM anywhere on this path — and stay
+        in the conversation (the counselor's crisis protocol owns later turns).
+        Falls back to the normal TTS+FLOAT render if the cached clip is missing,
+        and to on-screen text if even that fails; the fixed TEXT always lands in
+        both histories either way."""
+        logger.warning("[crisis] deterministic net fired: category=%s pattern=%s",
+                       hit.category, hit.pattern)  # no user text in the log
+        self._history_begin(user_text)
+        # Pause the clinical protocol permanently for this session; later
+        # turns run the full counselor with the crisis protocol.
+        runtime.enter_crisis(self.clinical)
+        text = crisis.RESPONSES[hit.category]
+        video = ensure_fixed_clip(text, crisis_clip_path(hit.category))
+        self._history_set_assistant(text)
+        if video is None and not self._aborted(turn):
+            # Cache miss (e.g. pre-warm failed): render it now rather than stay silent.
+            tts_path = tts.synthesize(text, None, self.cancel_event)
+            if tts_path is not None:
+                video = avatar.generate_video(tts_path)
+                try:
+                    os.remove(tts_path)
+                except OSError:
+                    pass
+        if video and not self._aborted(turn):
+            self.video_queue.put({
+                "video": video,
+                "sentence": text,
+                "_t_enqueue": time.perf_counter(),
+            })
+            self.state = "speaking"
+            self.video_queue.put(None)
+        else:
+            self.state = "idle"
+
+    # ---------- History management (ONE history; API view derived) ----------
+    # chat_history is the single conversation record. What the LLM API sees is
+    # derived from it on demand (_api_window): the most recent
+    # LLM_HISTORY_MAX_MESSAGES entries, never starting on an assistant turn.
+    # One list, no lockstep invariant to break on barge-in or LLM errors.
+    def _api_window(self):
+        """The sliding-window suffix of chat_history sent to the LLM API.
+        Caller must hold self._lock."""
+        win = [dict(m) for m in
+               self.chat_history[-config.LLM_HISTORY_MAX_MESSAGES:]]
+        if win and win[0]["role"] == "assistant":
+            del win[0]   # never orphan a reply from its user prompt
+        return win
+
     def _history_begin(self, user_text):
-        """Append the user turn to BOTH histories and return the API message list.
-        If the previous turn's user message is still unanswered (e.g. speech split
-        by a pause into two segments, so the first half hasn't been replied to yet),
-        MERGE the new text into it — never drop it. This preserves everything the
-        user said, reassembles the paused sentence into one turn, and still avoids
-        sending two user messages in a row to the API."""
+        """Append the user turn and return the API message list. If the
+        previous turn's user message is still unanswered (e.g. speech split by
+        a pause into two segments, so the first half hasn't been replied to
+        yet), MERGE the new text into it — never drop it. This preserves
+        everything the user said, reassembles the paused sentence into one
+        turn, and still avoids sending two user messages in a row to the API."""
         with self._lock:
-            for hist in (self.chat_history, self.llm_history):
-                if hist and hist[-1]["role"] == "user":
-                    hist[-1] = {"role": "user",
-                                "content": (hist[-1]["content"].rstrip()
-                                            + " " + user_text).strip()}
-                else:
-                    hist.append({"role": "user", "content": user_text})
-            llm._trim_history(self.llm_history)
-            messages = llm.build_messages(self.llm_history, dict(self.patient))
-            history_snapshot = list(self.llm_history)
+            hist = self.chat_history
+            if hist and hist[-1]["role"] == "user":
+                hist[-1] = {"role": "user",
+                            "content": (hist[-1]["content"].rstrip()
+                                        + " " + user_text).strip()}
+            else:
+                hist.append({"role": "user", "content": user_text})
+            window = self._api_window()
+            messages = llm.build_messages(window, dict(self.patient))
         # Fire-and-forget structured extraction to keep the patient profile current.
         # Runs off the hot path (never blocks TTS/display) and applies to the NEXT
         # turn's prompt, so age/sex/screening facts survive history-window trimming.
-        threading.Thread(target=self._extract_patient, args=(history_snapshot,),
+        threading.Thread(target=self._extract_patient, args=(window,),
                          name="patient-extract", daemon=True).start()
         return messages
 
@@ -266,17 +346,17 @@ class Pipeline:
                 if v in (None, "", [], {}):
                     continue
                 self.patient[k] = v
-        logger.info("[patient] profile now: %s", self.patient)
+        logger.info("[patient] profile now: %s", phi_keys(self.patient))
 
     def _history_set_assistant(self, text):
-        """Create or update the current assistant turn with the SAME text in both
-        histories, so display and API memory always agree."""
+        """Create or update the current assistant turn (display and API memory
+        are the same list, so they can never disagree)."""
         with self._lock:
-            for hist in (self.chat_history, self.llm_history):
-                if hist and hist[-1]["role"] == "assistant":
-                    hist[-1]["content"] = text
-                else:
-                    hist.append({"role": "assistant", "content": text})
+            hist = self.chat_history
+            if hist and hist[-1]["role"] == "assistant":
+                hist[-1]["content"] = text
+            else:
+                hist.append({"role": "assistant", "content": text})
 
     def _process_speech(self, audio_array, turn):
         """Full pipeline: ASR → LLM stream → TTS+FLOAT (pipelined) → video queue."""
@@ -287,8 +367,8 @@ class Pipeline:
                 return
 
             user_text = asr.transcribe_array(audio_array, sample_rate=16000)
-            logger.info(f"[latency] ASR done at +{time.perf_counter() - self._t0:.2f}s "
-                        f"-> {user_text!r}")
+            logger.info("[latency] ASR done at +%.2fs -> %s",
+                        time.perf_counter() - self._t0, phi(user_text))
 
             if not user_text.strip():
                 self.state = "idle"
@@ -298,19 +378,17 @@ class Pipeline:
                 self.state = "idle"
                 return
 
-            # Consent gate: the turn right after the greeting is the yes/no answer.
-            # A clear decline gets the fixed cached clip; yes/unclear/distress fall
-            # through to the full counselor (which owns the crisis protocol).
-            if self.awaiting_consent:
-                self.awaiting_consent = False
-                if llm.classify_consent(user_text) == "no":
-                    self._deliver_decline(user_text, turn)
-                    return
+            # Crisis safety net FIRST (overrides everything, incl. the consent
+            # gate): deterministic patterns, unioned with the LLM's own protocol.
+            hit = crisis.detect(user_text)
+            if hit:
+                self._deliver_crisis(user_text, hit, turn)
+                return
 
-            # Step 2: append the user turn to BOTH histories, then synthesize.
-            messages = self._history_begin(user_text)
-            self.state = "processing"
-            self._run_synthesis(messages, turn)
+            # Every other turn goes through the clinical state machine: the
+            # coder maps the words onto the expected input, the machine decides
+            # the transition, the LLM at most phrases bounded utterances.
+            self._protocol_turn(user_text, turn)
 
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
@@ -323,37 +401,197 @@ class Pipeline:
                 self.state = "idle"
                 return
 
-            # Consent gate (same as the voice path): a clear decline -> fixed clip.
-            if self.awaiting_consent:
-                self.awaiting_consent = False
-                if llm.classify_consent(user_text) == "no":
-                    self._deliver_decline(user_text, turn)
-                    return
+            # Crisis safety net FIRST (same as the voice path).
+            hit = crisis.detect(user_text)
+            if hit:
+                self._deliver_crisis(user_text, hit, turn)
+                return
 
-            messages = self._history_begin(user_text)
-            self.state = "processing"
-            self._run_synthesis(messages, turn)
+            # Same protocol path as the voice turns.
+            self._protocol_turn(user_text, turn)
 
         except Exception as e:
             logger.error(f"Pipeline error (text): {e}", exc_info=True)
             self.state = "idle"
 
-    def _run_synthesis(self, messages, turn):
-        """Dispatch to the configured synthesis mode. `messages` is the full API
-        message list (system + history + current user) built by the caller; the user
-        turn is already in both histories."""
-        mode = getattr(config, "SYNTHESIS_MODE", "stream_parallel")
-        if mode == "batch":
-            self._run_batch_synthesis(messages, turn)
-        elif mode == "stream":
-            self._run_pipelined_synthesis(messages, turn)
-        elif mode == "hybrid":
-            self._run_hybrid_synthesis(messages, turn)
-        else:
-            self._run_streaming_parallel_synthesis(messages, turn)
+    # ---------- Protocol turns: coder -> state machine -> bounded rendering ----------
 
-    def _run_streaming_parallel_synthesis(self, messages, turn):
-        """Fastest mode: stream sentences from the LLM (chat text appears live in
+    def _current_question(self):
+        """(question_text, options) for the machine's current option
+        expectation, from the structured instrument data."""
+        exp = self.clinical.expect
+        if exp.kind != "option":
+            return None, None
+        if exp.instrument == "prescreen":
+            item = PRE_SCREEN[exp.item_index].item
+        else:
+            item = BY_KEY[exp.instrument].items[exp.item_index]
+        return item.text, item.options
+
+    def _last_question_text(self):
+        """The most recent fixed question the avatar asked (for the consent
+        classifier's context); falls back to the greeting's consent ask."""
+        step = self.clinical.last_step
+        if step:
+            for utt in reversed(step.utterances):
+                if isinstance(utt, runtime.Say):
+                    return utt.text
+        return "May I ask you some questions about your health?"
+
+    def _protocol_turn(self, user_text, turn):
+        """Code the user's words onto the machine's expected input, advance the
+        protocol, and speak the resulting step. Ambiguity clarifies and re-asks;
+        it NEVER guesses a code and never moves the machine. The whole turn is
+        serialized under _protocol_lock so a superseded turn can never advance
+        the machine after a newer one already has."""
+        with self._protocol_lock:
+            if self._aborted(turn):
+                return
+            clinical = self.clinical
+
+            # In-crisis sessions: the protocol stays paused; every turn runs the
+            # full counselor (its prompt carries the complete crisis protocol).
+            if clinical.crisis:
+                messages = self._history_begin(user_text)
+                self.state = "processing"
+                self._run_crisis_synthesis(messages, turn)
+                return
+
+            # 1. Code the free text onto what the machine is waiting for. Any
+            #    ambiguity clarifies and re-asks WITHOUT moving the machine.
+            exp = clinical.expect
+            if exp.kind == "consent":
+                verdict = llm.classify_consent(
+                    user_text, question=self._last_question_text())
+                if verdict == "unclear":
+                    return self._clarify(user_text, turn)
+                if clinical.node == "consent":
+                    # THE study consent (the greeting's ask) -> audit trail.
+                    privacy.record_consent(self.audit_key, verdict)
+                value = verdict
+            elif exp.kind == "option":
+                question, options = self._current_question()
+                result = llm.code_option(question, options, user_text)
+                if "code" not in result:
+                    return self._clarify(user_text, turn)
+                value = result["code"]
+            elif exp.kind == "number":
+                result = llm.code_number(user_text)
+                if "value" not in result:
+                    return self._clarify(user_text, turn)
+                value = result["value"]
+            elif exp.kind == "open":
+                value = user_text
+            else:  # "end" — session already closed/declined; stay warm, done.
+                return self._deliver_step(user_text, runtime.Step(
+                    clinical.node, (runtime.LLMSay(
+                        "The screening session is already complete. In one warm "
+                        "sentence, acknowledge what the person said and remind "
+                        "them their provider will follow up with them."),),
+                    clinical.expect), turn)
+
+            # Coding may have taken a slow LLM round-trip; if a newer turn
+            # started meanwhile (barge-in, typed message), don't touch the machine.
+            if self._aborted(turn):
+                return
+
+            # 2. Advance the deterministic machine and 3. speak the result.
+            try:
+                step = runtime.advance(clinical, exp.kind, value)
+            except (runtime.ProtocolError, InvalidResponse):
+                # A coder/wiring bug must not strand the user: log loudly, then
+                # clarify and re-ask instead of guessing or going silent.
+                logger.exception("protocol advance failed; clarifying")
+                return self._clarify(user_text, turn)
+
+            if clinical.node == "declined":
+                # Machine recorded the decline; the fixed decline path speaks it
+                # and ends the session (mic off via `ended`).
+                return self._deliver_decline(user_text, turn)
+            self._deliver_step(user_text, step, turn)
+
+    def _clarify(self, user_text, turn):
+        """Ambiguous answer: one bounded LLM clarification that re-poses the
+        CURRENT question. The machine's expectation is untouched, so the next
+        answer is coded against the same item (guess-free by construction)."""
+        exp = self.clinical.expect
+        question = self._last_question_text()
+        if exp.kind == "option":
+            q, options = self._current_question()
+            labels = "; ".join(o.label for o in options)
+            instruction = (
+                "The person's answer didn't clearly match one of the answer "
+                f"choices. In one or two short sentences, gently re-ask: "
+                f"{q!r} — you may briefly mention the choices ({labels}). "
+                "Do not suggest which one to pick.")
+        elif exp.kind == "number":
+            instruction = ("In one short sentence, gently ask again for a "
+                           "single number from 0 to 10.")
+        else:
+            instruction = (f"The person's answer to {question!r} wasn't a "
+                           "clear yes or no. In one short sentence, gently "
+                           "ask again.")
+        self._deliver_step(
+            user_text,
+            runtime.Step(self.clinical.node, (runtime.LLMSay(instruction),),
+                         exp),
+            turn)
+
+    def _render_dynamic(self, text):
+        """TTS + FLOAT for a non-cached utterance; None on failure/cancel."""
+        tts_path = tts.synthesize(text, None, self.cancel_event)
+        if tts_path is None:
+            return None
+        video = avatar.generate_video(tts_path)
+        try:
+            os.remove(tts_path)
+        except OSError:
+            pass
+        return video
+
+    def _deliver_step(self, user_text, step, turn):
+        """Speak one machine step: fixed utterances come from the shared clip
+        cache (rendered once, reused across sessions); LLMSay utterances are
+        phrased by the bounded LLM then rendered. Enqueued strictly in order."""
+        self._history_begin(user_text)
+        self.state = "processing"
+        spoken = []
+        for utt in step.utterances:
+            if self._aborted(turn):
+                return
+            if isinstance(utt, runtime.Say):
+                text = utt.text
+                video = ensure_fixed_clip(text, protocol_clip_path(utt.key))
+                if video is None and not self._aborted(turn):
+                    video = self._render_dynamic(text)   # cache miss fallback
+            else:
+                with self._lock:
+                    history = self._api_window()
+                    patient = dict(self.patient)
+                text = llm.phrase_utterance(utt.instruction, history, patient)
+                if not text.strip():
+                    continue          # bounded utterance failed -> skip, protocol continues
+                video = None if self._aborted(turn) else self._render_dynamic(text)
+            if self._aborted(turn):
+                return
+            spoken.append(text)
+            # Text lands in the chat even if this clip failed to render.
+            self._history_set_assistant(" ".join(spoken))
+            if video:
+                self.video_queue.put({
+                    "video": video,
+                    "sentence": text,
+                    "_t_enqueue": time.perf_counter(),
+                })
+                self.state = "speaking"
+        if not self._aborted(turn):
+            self.video_queue.put(None)
+            self.state = "speaking"
+
+    def _run_crisis_synthesis(self, messages, turn):
+        """CRISIS turns only — the sole remaining full-LLM synthesis path (every
+        normal turn goes through the clinical protocol instead). Streams
+        sentences from the LLM (chat text appears live in
         <1s) AND render each sentence's TTS+FLOAT concurrently across the whole
         GPU pool, while enqueuing strictly in sentence order.
 
@@ -400,7 +638,7 @@ class Pipeline:
                         logger.info("[latency] LLM first sentence at +%.2fs",
                                     time.perf_counter() - self._t0)
                     full_response += sentence
-                    logger.info(f"LLM sentence: {sentence}")
+                    logger.info("LLM sentence: %s", phi(sentence))
 
                     # Live update BOTH histories so display and API memory agree.
                     self._history_set_assistant(full_response)
@@ -416,7 +654,6 @@ class Pipeline:
                 # message, which the next turn merges into (see _history_begin).
                 if full_response.strip() and not self._aborted(turn):
                     self._history_set_assistant(full_response)
-                    self._pending_assistant_text = full_response
                 futures_q.put(SENTINEL)
 
         first_seg = True
@@ -463,199 +700,6 @@ class Pipeline:
             self.video_queue.put(None)
             self.state = "speaking"
 
-    @staticmethod
-    def _split_sentences(text):
-        """Split a full response into sentences (same boundaries as the LLM
-        streamer): only on sentence-final punctuation, so each spoken clip is a
-        whole sentence."""
-        endings = {"。", "！", "？", ".", "!", "?", "\n"}
-        sentences, buf = [], ""
-        for ch in text:
-            buf += ch
-            if ch in endings:
-                s = buf.strip()
-                if s:
-                    sentences.append(s)
-                buf = ""
-        if buf.strip():
-            sentences.append(buf.strip())
-        return sentences
-
-    def _run_hybrid_synthesis(self, messages, turn):
-        """Hybrid: get the FULL LLM answer first so the chat shows the complete,
-        stable text at once (no live updates), then render per-sentence TTS+FLOAT
-        (pipelined) so the avatar starts speaking quickly. The displayed answer
-        text never changes while it plays.
-        """
-        if self._aborted(turn):
-            self.state = "idle"
-            return
-
-        # 1. Full answer in one shot (no live, sentence-by-sentence chat updates).
-        full_response = (llm.chat(messages) or "").strip()
-        logger.info(f"LLM full response: {full_response}")
-        if not full_response or self._aborted(turn):
-            # Nothing to commit; leave the user message (merged by the next turn).
-            self.state = "idle"
-            return
-
-        # 2. Commit the complete answer to BOTH histories (one stable chat entry).
-        self._history_set_assistant(full_response)
-        self._pending_assistant_text = full_response
-
-        # 3. Render sentences CONCURRENTLY across the FLOAT GPU pool, but enqueue
-        #    them strictly in order so the avatar still speaks them in sequence.
-        #    avatar.generate_video() is thread-safe and hands each call a free GPU
-        #    (0/1/2), so up to len(FLOAT_GPUS) sentences render in parallel,
-        #    cutting total render time from ~N to ~ceil(N/len(GPUs)) clips.
-        #    Note: first-segment latency is unchanged (still one TTS + one render);
-        #    parallelism speeds up sentences 2..N so playback doesn't stall.
-        sentences = self._split_sentences(full_response)
-
-        def _render(sentence):
-            if self._aborted(turn):
-                return None
-            tts_path = tts.synthesize(sentence, None, self.cancel_event)
-            if tts_path is None or self._aborted(turn):
-                return None
-            return avatar.generate_video(tts_path)
-
-        with ThreadPoolExecutor(max_workers=max(1, len(config.FLOAT_GPUS))) as ex:
-            futures = [ex.submit(_render, s) for s in sentences]
-            for i, fut in enumerate(futures):
-                if self._aborted(turn):
-                    for g in futures[i:]:
-                        g.cancel()
-                    break
-                # Wait for sentence i in order (sentences i+1.. render in parallel).
-                video_path = fut.result()
-                if video_path is None or self._aborted(turn):
-                    for g in futures[i:]:
-                        g.cancel()
-                    break
-                self.video_queue.put({"video": video_path, "sentence": sentences[i]})
-                self.state = "speaking"
-
-        if not self._aborted(turn):
-            self.video_queue.put(None)
-            self.state = "speaking"
-
-    def _run_batch_synthesis(self, messages, turn):
-        """Batch mode: get the FULL LLM answer first, show it at once, then do a
-        SINGLE TTS + FLOAT render. The chat no longer updates live and the avatar
-        plays one continuous clip instead of changing per sentence.
-        """
-        if self._aborted(turn):
-            self.state = "idle"
-            return
-
-        # 1. Full answer in one shot (no live, sentence-by-sentence updates).
-        full_response = (llm.chat(messages) or "").strip()
-        logger.info(f"LLM full response: {full_response}")
-        if not full_response or self._aborted(turn):
-            # Nothing to commit; leave the user message (merged by the next turn).
-            self.state = "idle"
-            return
-
-        # 2. Commit the complete answer to BOTH histories (one stable chat entry).
-        self._history_set_assistant(full_response)
-        self._pending_assistant_text = full_response
-
-        # 3. One TTS for the whole answer.
-        tts_path = tts.synthesize(full_response, None, self.cancel_event)
-        if tts_path is None or self._aborted(turn):
-            self.state = "idle"
-            return
-
-        # 4. One FLOAT video for the whole answer.
-        video_path = avatar.generate_video(tts_path)
-        if video_path is None or self._aborted(turn):
-            self.state = "idle"
-            return
-
-        # 5. Play it as a single segment, then signal completion.
-        self.video_queue.put({"video": video_path, "sentence": full_response})
-        self.state = "speaking"
-        self.video_queue.put(None)
-
-    def _run_pipelined_synthesis(self, messages, turn):
-        """Pipelined LLM → TTS → FLOAT: overlap TTS(N+1) with FLOAT(N)."""
-        full_response = ""
-        pending_tts_future = None  # Future for TTS of next sentence
-        pending_tts_sentence = None
-
-        with ThreadPoolExecutor(max_workers=1) as tts_executor:
-            for sentence in llm.chat_stream(messages, cancel_event=self.cancel_event):
-                if self._aborted(turn):
-                    break
-
-                full_response += sentence
-                logger.info(f"LLM sentence: {sentence}")
-
-                # Progressively update BOTH histories so display and API memory agree.
-                self._history_set_assistant(full_response)
-
-                if self._aborted(turn):
-                    break
-
-                # If there's a pending TTS result from prev iteration, render its FLOAT now
-                # while we kick off TTS for current sentence in parallel
-                if pending_tts_future is not None:
-                    # Start TTS for current sentence in background
-                    current_tts_future = tts_executor.submit(
-                        tts.synthesize, sentence, None, self.cancel_event
-                    )
-                    current_tts_sentence = sentence
-
-                    # Wait for previous TTS and render FLOAT
-                    prev_tts_path = pending_tts_future.result()
-                    if prev_tts_path is None or self._aborted(turn):
-                        pending_tts_future = None
-                        break
-
-                    video_path = avatar.generate_video(prev_tts_path)
-                    if video_path is None or self._aborted(turn):
-                        pending_tts_future = None
-                        break
-
-                    self.video_queue.put({
-                        "video": video_path,
-                        "sentence": pending_tts_sentence
-                    })
-                    self.state = "speaking"
-
-                    # Current sentence's TTS is now our pending
-                    pending_tts_future = current_tts_future
-                    pending_tts_sentence = current_tts_sentence
-                else:
-                    # First sentence: just start TTS, no FLOAT to overlap with
-                    pending_tts_future = tts_executor.submit(
-                        tts.synthesize, sentence, None, self.cancel_event
-                    )
-                    pending_tts_sentence = sentence
-
-            # Process the last pending TTS result
-            if pending_tts_future is not None and not self._aborted(turn):
-                tts_path = pending_tts_future.result()
-                if tts_path is not None and not self._aborted(turn):
-                    video_path = avatar.generate_video(tts_path)
-                    if video_path is not None and not self._aborted(turn):
-                        self.video_queue.put({
-                            "video": video_path,
-                            "sentence": pending_tts_sentence
-                        })
-                        self.state = "speaking"
-
-        # Finalize history only if we still own the turn; never delete the user's
-        # message (a produced-nothing turn is merged by the next turn).
-        if full_response.strip() and not self._aborted(turn):
-            self._history_set_assistant(full_response)
-            self._pending_assistant_text = full_response
-            self.video_queue.put(None)
-
-        if not self._aborted(turn):
-            self.state = "speaking"
-
     def get_next_video(self):
         """Non-blocking: get next video from queue.
 
@@ -669,7 +713,6 @@ class Pipeline:
                 # End of response
                 self.state = "idle"
                 return False
-            self._played_sentences.append(item["sentence"])
             return item
         except queue.Empty:
             return None
@@ -691,14 +734,12 @@ class Pipeline:
         self.cancel_event.clear()
         self.chat_history.clear()
         self.patient.clear()
-        self.awaiting_consent = False
         self.ended = False
-        self._pending_assistant_text = ""
-        self._played_sentences = []
+        self.clinical = runtime.ClinicalSession()
+        runtime.start(self.clinical)
         while not self.video_queue.empty():
             try:
                 self.video_queue.get_nowait()
             except queue.Empty:
                 break
         self.state = "idle"
-        self.llm_history.clear()

@@ -104,6 +104,13 @@ class FloatGPUPool:
 
         nfe overrides the number of FLOAT function evaluations for this clip only
         (lower = faster, slightly lower quality); defaults to config.FLOAT_NFE.
+
+        KNOWN LIMIT (documented, not fixable here): FLOAT's ODE sampler lives in
+        the external float/ repo (off-limits to this project), so a single
+        run_inference() call cannot be cancelled mid-sampling — a barge-in only
+        takes effect between clips. Mitigation: low NFE (config.FLOAT_NFE /
+        FLOAT_NFE_FIRST) keeps each clip's render short, and since the protocol
+        rewrite all fixed content is pre-rendered, so runtime renders are rare.
         """
         if ref_image is None:
             ref_image = config.AVATAR_IMAGE

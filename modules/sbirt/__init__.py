@@ -14,16 +14,20 @@ Screening, Brief Intervention, and Referral to Treatment model:
 Edit the clinical content in the data modules; the prompt updates automatically.
 """
 
-from . import instruments, intervention, referral, workflow
+from . import (crisis, instruments, intervention, referral, runtime,
+               templates, workflow)
 from .instruments import ALL_INSTRUMENTS, Instrument, risk_band_for
 from .prompt import build_system_prompt
 from .workflow import ENTRY_NODE, NODES
 
 __all__ = [
     "build_system_prompt",
+    "crisis",
     "instruments",
     "intervention",
     "referral",
+    "runtime",
+    "templates",
     "workflow",
     "ALL_INSTRUMENTS",
     "Instrument",

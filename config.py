@@ -11,32 +11,27 @@ load_dotenv()
 # what makes Ctrl+C exit cleanly instead of hanging or throwing tracebacks.
 SHUTTING_DOWN = threading.Event()
 
-# Paths
-FLOAT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "float")
+# Paths — single source of truth. Every directory root is defined ONCE here;
+# everything else (this file, main.py, modules/) derives from these, never by
+# reverse-engineering a root out of some file's location (e.g. dirname of a clip
+# path — that silently breaks the moment the clip moves). Move a root → one edit.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # digital-human/
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")           # source imgs + all cached clips live under here
+CLIPS_DIR = os.path.join(ASSETS_DIR, "clips")           # ALL pre-rendered fixed video clips
+TEMP_DIR = os.path.join(BASE_DIR, "tmp")                # per-sentence dynamic renders (transient)
+CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
+RECORDS_DIR = os.path.join(BASE_DIR, "records")
+CERTS_DIR = os.path.join(BASE_DIR, "certs")
+
+FLOAT_DIR = os.path.join(os.path.dirname(BASE_DIR), "float")   # sibling repo, off-limits to edit
 FLOAT_CKPT = os.path.join(FLOAT_DIR, "checkpoints", "float.pth")
-AVATAR_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "avatar.png")
-TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+AVATAR_IMAGE = os.path.join(ASSETS_DIR, "avatar.png")
 
 # LLM
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "google/gemini-2.5-flash"
 
-# Synthesis mode (how an LLM answer becomes speech + avatar video):
-#   "stream_parallel" = stream sentence-by-sentence (text appears live in <1s) AND
-#              render TTS+FLOAT for each sentence concurrently across the whole GPU
-#              pool, enqueuing strictly in order. First-segment latency = 1 TTS +
-#              1 FLOAT; sentences 2..N render on the other GPUs while sentence 1
-#              plays, so playback doesn't stall. This is the fastest+smoothest mode.
-#   "hybrid" = get the FULL answer first, show the complete text at once (stable,
-#              never live-updates), then render per-sentence so the avatar starts
-#              speaking in ~5s. Stable display, but text appears only after the
-#              whole answer is generated.
-#   "batch"  = full answer, then a SINGLE TTS + FLOAT video (one continuous clip,
-#              most stable, but ~20-35s wait before it starts speaking).
-#   "stream" = stream sentence-by-sentence, but FLOAT renders serially on ONE GPU
-#              (legacy; sentences 2..N stall, wasting the other GPUs).
-SYNTHESIS_MODE = "stream_parallel"
 # The SBIRT counselor's system prompt is BUILT from the structured clinical
 # framework in modules/sbirt/ (instruments, brief-intervention techniques,
 # referral pathways, state machine) rather than hand-written here. This
@@ -59,8 +54,8 @@ TTS_VOICE = "en-US-GuyNeural"
 ASR_MODEL = "iic/SenseVoiceSmall"
 
 # GPU allocation
-FLOAT_GPUS = [2]    # 3 GPUs for FLOAT parallel rendering
-ASR_GPU = 2         # Dedicated GPU for ASR
+FLOAT_GPUS = [3]    # 3 GPUs for FLOAT parallel rendering
+ASR_GPU = 3         # Dedicated GPU for ASR
 
 # FLOAT
 FLOAT_NFE = 10            # Number of function evaluations (lower = faster, 7-10)
@@ -102,6 +97,14 @@ TEMP_CLEAN_INTERVAL_SEC = 30
 # default — the synchronous disk write was stalling the audio event loop.
 DEBUG_SAVE_AUDIO = os.getenv("DEBUG_SAVE_AUDIO", "0").lower() in ("1", "true", "yes")
 
+# Consent audit trail (append-only JSONL): decision + timestamp + exact-wording
+# version per session. No transcripts, no screening data. records/ is
+# gitignored; the directory is created on first write.
+CONSENT_LOG_PATH = os.getenv(
+    "CONSENT_LOG_PATH",
+    os.path.join(RECORDS_DIR, "consent_log.jsonl"),
+)
+
 # --- EOU: semantic end-of-utterance / turn detection (smart-turn v3) ---
 # When enabled, a VAD-detected pause is only treated as the end of the user's turn
 # if the smart-turn model agrees the utterance is semantically complete. This stops
@@ -109,10 +112,7 @@ DEBUG_SAVE_AUDIO = os.getenv("DEBUG_SAVE_AUDIO", "0").lower() in ("1", "true", "
 # promptly on a finished thought. Tiny ONNX model on CPU (~28ms); isolated from the
 # FLOAT GPUs. If the model can't load, VAD transparently falls back to pure silence.
 USE_EOU = os.getenv("USE_EOU", "1").lower() not in ("0", "false", "no")
-EOU_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "checkpoints", "smart-turn", "smart-turn-v3.2-cpu.onnx",
-)
+EOU_MODEL_PATH = os.path.join(CHECKPOINTS_DIR, "smart-turn", "smart-turn-v3.2-cpu.onnx")
 EOU_THRESHOLD = 0.5          # P(complete) >= this -> end the turn (↑ more patient, ↓ snappier)
 EOU_CONFIRM_CONSULTS = 2     # require this many CONSECUTIVE 'complete' verdicts before
                              # ending — hysteresis against a momentary clause-boundary
@@ -125,8 +125,8 @@ EOU_ONNX_THREADS = 2         # CPU threads for the ONNX session
 # Reap a per-user session this long after its last client disconnects (idle only).
 SESSION_IDLE_TTL_SEC = 600
 
-# Idle video
-IDLE_VIDEO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "idle_loop.mp4")
+# Idle video (ambient loop; lives at the assets root, not a spoken clip)
+IDLE_VIDEO_PATH = os.path.join(ASSETS_DIR, "idle_loop.mp4")
 IDLE_VIDEO_DURATION = 10.0  # seconds; longer = fewer loop seams
 
 # Fixed opening the counselor always says first. Because it is IDENTICAL every
@@ -141,12 +141,12 @@ GREETING_TEXT = (
     "Your answers will be treated as confidential and as protected health information. "
     "May I ask you some questions about your health?"
 )
-GREETING_VIDEO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "greeting.mp4")
+GREETING_VIDEO_PATH = os.path.join(CLIPS_DIR, "greeting.mp4")
 
 # Fixed reply when the user DECLINES consent at the greeting. Cached to a clip too,
 # so it is verbatim + instant like the greeting (no per-session LLM/TTS/FLOAT).
 DECLINE_TEXT = "Thank you, and your provider will address these during your visit."
-DECLINE_VIDEO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "decline.mp4")
+DECLINE_VIDEO_PATH = os.path.join(CLIPS_DIR, "decline.mp4")
 
 # Server / public access
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # bind all interfaces for public access
@@ -154,7 +154,6 @@ SERVER_PORT = int(os.getenv("SERVER_PORT", "17861"))
 WS_PORT = int(os.getenv("WS_PORT", "17862"))
 
 # HTTPS — required for browser microphone (getUserMedia) on non-localhost origins.
-CERTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
 SSL_CERT_FILE = os.getenv("SSL_CERT_FILE", os.path.join(CERTS_DIR, "cert.pem"))
 SSL_KEY_FILE = os.getenv("SSL_KEY_FILE", os.path.join(CERTS_DIR, "key.pem"))
 # Enabled by default; set ENABLE_HTTPS=0 to force plain HTTP (mic then only works on localhost).

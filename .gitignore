@@ -13,6 +13,9 @@ checkpoints
 tmp/
 results/
 
+# Consent audit trail (per-deployment record, never in the repo)
+records/
+
 # Python
 __pycache__/
 *.py[cod]

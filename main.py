@@ -25,9 +25,9 @@ from starlette.staticfiles import StaticFiles
 
 from modules.pipeline import Pipeline
 from modules.vad import VoiceActivityDetector
-from modules import asr
+from modules import asr, privacy
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = config.BASE_DIR   # single source of truth (config.py); don't redefine the project root here
 
 
 # --------------- Per-session state ---------------
@@ -37,8 +37,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # clients. Nothing is shared between sessions, so two users never cross-talk.
 
 class Session:
-    def __init__(self):
-        self.pipeline = Pipeline()
+    def __init__(self, sid: str = "default"):
+        self.pipeline = Pipeline(audit_key=sid)
         self.vad = VoiceActivityDetector()
         self.mic_enabled = False
         self.speech_started_notified = False
@@ -65,7 +65,7 @@ def get_or_create_session(sid: str) -> Session:
     with _sessions_lock:
         s = sessions.get(sid)
         if s is None:
-            s = Session()
+            s = Session(sid)
             sessions[sid] = s
             logger.info("New session %s (total sessions: %d)", sid, len(sessions))
         return s
@@ -116,7 +116,7 @@ async def api_greet(request: Request):
     of which previously happened when greeting was tied to the mic toggle)."""
     session = await session_for(request)
     p = session.pipeline
-    if session.mic_enabled and not p.chat_history and not p.awaiting_consent:
+    if session.mic_enabled and not p.chat_history:
         p.start_greeting()
     return JSONResponse({"status": "ok"})
 
@@ -170,7 +170,7 @@ async def api_test_asr(request: Request):
     # Run ASR
     from modules import asr
     text = asr.transcribe_array(audio_f32, sample_rate=16000)
-    logger.info(f"[TestASR] Result: {text}")
+    logger.info("[TestASR] Result: %s", privacy.phi(text))
 
     return JSONResponse({
         "text": text,
@@ -255,7 +255,8 @@ async def ws_audio(websocket: WebSocket):
                         text = await asyncio.get_running_loop().run_in_executor(
                             None, asr.transcribe_array, pending)
                         if text.strip() and not _looks_like_echo(text, session.pipeline):
-                            logger.info("[barge-in] user speech detected: %r -> interrupting", text)
+                            logger.info("[barge-in] user speech detected: %s -> interrupting",
+                                        privacy.phi(text))
                             session.barge_done = True
                             session.speech_started_notified = True
                             session.pipeline.on_speech_start()
@@ -363,11 +364,9 @@ async def _poll_session(session: Session):
         # New video segment
         video_path = item["video"]
         if video_path.startswith(os.path.join(BASE_DIR, "tmp")):
-            video_url = "/video/tmp/" + os.path.basename(video_path)
-        elif video_path.startswith(os.path.join(BASE_DIR, "assets")):
-            video_url = "/video/assets/" + os.path.basename(video_path)
+            video_url = "/video/tmp/"  + os.path.basename(video_path)
         else:
-            video_url = "/video/tmp/" + os.path.basename(video_path)
+            video_url = "/video/assets/clips/" + os.path.basename(video_path)
 
         # Latency: how long the finished clip sat in the queue before delivery.
         t_enq = item.get("_t_enqueue")
@@ -490,9 +489,14 @@ def _warmup_models():
 
 
 def _reap_idle_sessions():
-    """Drop sessions whose clients have all been gone (idle) for a grace period,
-    so distinct browsers over time don't leak Pipeline/VAD objects forever. The
-    shared 'default' session is never reaped."""
+    """Drop sessions whose clients have all been gone for a grace period, so
+    distinct browsers over time don't leak Pipeline/VAD objects forever. The
+    shared 'default' session is never reaped.
+
+    Deliberately does NOT require pipeline.state == 'idle': barge-ins and
+    aborted turns can strand a session in 'listening'/'speaking' forever, and
+    with zero connected clients nobody is watching anyway — cancel any
+    in-flight response, then reap."""
     grace = getattr(config, "SESSION_IDLE_TTL_SEC", 600)
     now = time.time()
     with _sessions_lock:
@@ -500,8 +504,9 @@ def _reap_idle_sessions():
             if sid == "default":
                 continue
             s = sessions[sid]
-            if (not s.state_clients and s.pipeline.state == "idle"
+            if (not s.state_clients
                     and s.empty_since and now - s.empty_since > grace):
+                s.pipeline.cancel_response()   # stop in-flight work first
                 del sessions[sid]
                 logger.info("Reaped idle session %s (total sessions: %d)", sid, len(sessions))
 

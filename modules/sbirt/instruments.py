@@ -4,26 +4,68 @@ Single source of truth for the screening tools the counselor is allowed to use.
 Each instrument is plain data — items, scoring rule, and risk bands — so the
 clinical content can be reviewed and updated here WITHOUT touching prompt strings
 or pipeline code. `render()` turns any instrument into prompt-ready text, and
-`risk_band_for()` maps a computed score to its SBIRT action (the "data
-structuring" the engineer persona is asked to do).
+`risk_band_for()` maps a computed score to its SBIRT action.
 
-References: WHO AUDIT manual; Skinner DAST-10; Ewing CAGE / Brown CAGE-AID;
-NIDA Quick Screen / NM ASSIST; TAPS tool; Knight CRAFFT 2.1.
+The instruments this app actually ADMINISTERS (per the study protocol in
+SBIRT_Reference/) carry fully structured items — official interview wording plus
+an ordered option list with per-option scores — so the deterministic scoring
+functions below, the runtime state machine (runtime.py), constrained NLU
+coding, and fixed-clip pre-generation all read from the same data. The remaining
+instruments are prompt-only reference and keep plain-string items.
+
+Authoritative sources (see SBIRT_Reference/):
+  • AUDIT items/options/skip rules — WHO AUDIT manual, Box 4 interview version
+    ("AUDIT.pdf" / "AUDIT Manual.pdf").
+  • DAST-10 items as worded for THIS study — "Case Cards UH - SBIRT Client
+    Generic Provider.pdf" (see the item-3 deviation note below).
+  • Pre-screen ("SBIRT 3 Questions") and the four feedback risk zones —
+    "AI SBIRT app dialogue for study.docx".
+Other references: Skinner DAST-10; Ewing CAGE / Brown CAGE-AID; NIDA Quick
+Screen / NM ASSIST; TAPS tool; Knight CRAFFT 2.1.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
+
+
+@dataclass(frozen=True)
+class Option:
+    """One answer choice: exact wording + the points it contributes."""
+
+    label: str
+    score: int
+
+
+@dataclass(frozen=True)
+class Item:
+    """One administered question: official wording + ordered options.
+
+    A recorded response is the option's INDEX in `options` (its "code");
+    the contributed score is `options[code].score`. For most items code ==
+    score, but e.g. AUDIT items 9-10 score 0/2/4 for codes 0/1/2.
+    """
+
+    text: str
+    options: tuple[Option, ...]
+    note: str = ""  # skip rule / scoring deviation, rendered with the item
 
 
 @dataclass(frozen=True)
 class RiskBand:
-    """A scoring zone and the SBIRT action it triggers."""
+    """A scoring zone and the SBIRT action it triggers.
+
+    `zone` is the stable key used by the study's feedback templates and tests:
+    one of "healthy" | "risky" | "harmful" | "dependent" for administered
+    instruments; "" for prompt-only reference instruments.
+    """
 
     label: str
     low: int          # inclusive lower bound of the raw score
     high: int         # inclusive upper bound
     action: str       # which SBIRT step this zone routes to
+    zone: str = ""
 
     def contains(self, score: int) -> bool:
         return self.low <= score <= self.high
@@ -35,17 +77,26 @@ class Instrument:
     name: str
     domain: str            # alcohol | drugs | tobacco | combined | adolescent
     when_to_use: str
-    items: tuple[str, ...]
+    items: tuple[Item | str, ...]
     response_scale: str
     scoring: str
     bands: tuple[RiskBand, ...]
+    preamble: str = ""     # spoken once before item 1 (from the study protocol)
 
     def render(self) -> str:
         lines = [f"### {self.name}  ({self.domain}, {len(self.items)} items)",
                  f"When to use: {self.when_to_use}",
                  f"Response scale: {self.response_scale}",
                  "Items:"]
-        lines += [f"  {i}. {item}" for i, item in enumerate(self.items, 1)]
+        for i, item in enumerate(self.items, 1):
+            if isinstance(item, str):
+                lines.append(f"  {i}. {item}")
+            else:
+                opts = " / ".join(f"{o.score}={o.label}" for o in item.options)
+                line = f"  {i}. {item.text}  [{opts}]"
+                if item.note:
+                    line += f"  ({item.note})"
+                lines.append(line)
         lines.append(f"Scoring: {self.scoring}")
         lines.append("Risk bands → action:")
         lines += [f"  • {b.low}–{b.high}: {b.label} → {b.action}" for b in self.bands]
@@ -60,14 +111,56 @@ def risk_band_for(instrument: Instrument, score: int) -> RiskBand | None:
     return None
 
 
-# --- Pre-screen: single-question filters (NIDA Quick Screen frequency item) ----
-# A "yes" to any of these opens the matching full instrument. This keeps a
-# low-risk user from being walked through a 10-item questionnaire.
+# --- Shared option scales (exact wordings from the WHO AUDIT Box 4 form) -----
+_FREQ_5 = (
+    Option("Never", 0),
+    Option("Less than monthly", 1),
+    Option("Monthly", 2),
+    Option("Weekly", 3),
+    Option("Daily or almost daily", 4),
+)
+_YES_NO_TIMEFRAMED = (
+    Option("No", 0),
+    Option("Yes, but not in the last year", 2),
+    Option("Yes, during the last year", 4),
+)
+_NO_YES = (Option("No", 0), Option("Yes", 1))
+
+
+# --- Pre-screen: the study's "SBIRT 3 Questions" ------------------------------
+# This app's pre-screen per the study protocol (app dialogue + case cards) —
+# NOT the 4-item NIDA Quick Screen below, which stays as prompt-only reference.
+# score > 0 on a question = positive pre-screen for that domain.
+
+@dataclass(frozen=True)
+class PreScreenQuestion:
+    key: str      # "tobacco" | "alcohol" | "drugs"
+    item: Item
+
+
+PRE_SCREEN: tuple[PreScreenQuestion, ...] = (
+    PreScreenQuestion("tobacco", Item(
+        "Do you smoke cigarettes or use other tobacco products?",
+        _NO_YES,
+    )),
+    PreScreenQuestion("alcohol", Item(
+        "When was the last time you had more than 4 drinks in one day?",
+        (Option("Never or more than a year ago", 0),
+         Option("Within the last year", 1)),
+    )),
+    PreScreenQuestion("drugs", Item(
+        "How many times in the past year have you used an illegal drug or "
+        "used a prescription medication for nonmedical reasons?",
+        (Option("None", 0), Option("One or more", 1)),
+    )),
+)
+
+
 NIDA_QUICK_SCREEN = Instrument(
     key="nida_quick",
     name="NIDA Quick Screen (pre-screen)",
     domain="combined",
-    when_to_use="First substance question. Ask before any full instrument.",
+    when_to_use="Reference only — this app administers the study's own 3-question pre-screen.",
     items=(
         "In the PAST YEAR, how often have you had 5+ (men) / 4+ (women) drinks in a day?",
         "In the past year, how often have you used tobacco products?",
@@ -101,58 +194,113 @@ AUDIT_C = Instrument(
     ),
 )
 
+# Official WHO interview version (Box 4). Skip rules are encoded in next_item_index()
+# from the notes below: item 1 "Never" skips to items 9-10; items 2+3 totalling
+# 0 skips to items 9-10. Skipped items score 0.
 AUDIT = Instrument(
     key="audit",
     name="AUDIT (alcohol, full 10-item)",
     domain="alcohol",
-    when_to_use="Positive AUDIT-C or unclear alcohol risk; gives a treatment zone.",
+    when_to_use="Positive alcohol pre-screen (>4 drinks in a day within the past year).",
+    preamble=(
+        "Now I am going to ask you some questions about your use of alcoholic "
+        "beverages during this past year."
+    ),
     items=(
-        "Frequency of drinking (0–4)",
-        "Typical quantity per occasion (0–4)",
-        "Frequency of 6+ drinks on one occasion (0–4)",
-        "Unable to stop drinking once started, past year (0–4)",
-        "Failed to do what was normally expected because of drinking (0–4)",
-        "Needed a first drink in the morning (eye-opener) (0–4)",
-        "Guilt or remorse after drinking (0–4)",
-        "Unable to remember the night before (blackout) (0–4)",
-        "You or someone else injured because of your drinking (0/2/4)",
-        "Others concerned / suggested you cut down (0/2/4)",
+        Item("How often do you have a drink containing alcohol?",
+             (Option("Never", 0),
+              Option("Monthly or less", 1),
+              Option("2 to 4 times a month", 2),
+              Option("2 to 3 times a week", 3),
+              Option("4 or more times a week", 4)),
+             note="0 (Never) → skip to items 9–10"),
+        Item("How many drinks containing alcohol do you have on a typical day "
+             "when you are drinking?",
+             (Option("1 or 2", 0),
+              Option("3 or 4", 1),
+              Option("5 or 6", 2),
+              Option("7, 8, or 9", 3),
+              Option("10 or more", 4))),
+        Item("How often do you have six or more drinks on one occasion?",
+             _FREQ_5,
+             note="if items 2+3 total 0 → skip to items 9–10"),
+        Item("How often during the last year have you found that you were not "
+             "able to stop drinking once you had started?", _FREQ_5),
+        Item("How often during the last year have you failed to do what was "
+             "normally expected from you because of drinking?", _FREQ_5),
+        Item("How often during the last year have you needed a first drink in "
+             "the morning to get yourself going after a heavy drinking session?",
+             _FREQ_5),
+        Item("How often during the last year have you had a feeling of guilt "
+             "or remorse after drinking?", _FREQ_5),
+        Item("How often during the last year have you been unable to remember "
+             "what happened the night before because you had been drinking?",
+             _FREQ_5),
+        Item("Have you or someone else been injured as a result of your "
+             "drinking?", _YES_NO_TIMEFRAMED),
+        Item("Has a relative or friend or a doctor or another health worker "
+             "been concerned about your drinking or suggested you cut down?",
+             _YES_NO_TIMEFRAMED),
     ),
     response_scale="Items 1–8: 0–4; items 9–10: 0/2/4",
     scoring="Sum all items (0–40). Zones per WHO manual.",
     bands=(
-        RiskBand("Zone I – Low risk", 0, 7, "Alcohol education / affirmation"),
-        RiskBand("Zone II – Risky/hazardous", 8, 15, "Brief intervention (simple advice)"),
-        RiskBand("Zone III – Harmful", 16, 19, "Brief intervention + brief counseling + monitor"),
-        RiskBand("Zone IV – Likely dependence", 20, 40, "Refer to specialist assessment/treatment"),
+        RiskBand("Zone I – Low risk (Healthy)", 0, 7,
+                 "Alcohol education / affirmation", zone="healthy"),
+        RiskBand("Zone II – Risky/hazardous", 8, 15,
+                 "Brief intervention (simple advice)", zone="risky"),
+        RiskBand("Zone III – Harmful", 16, 19,
+                 "Brief intervention + brief counseling + monitor", zone="harmful"),
+        RiskBand("Zone IV – Likely dependence", 20, 40,
+                 "Refer to specialist assessment/treatment", zone="dependent"),
     ),
 )
 
+# Items as worded in THIS study's protocol (case cards). NOTE on item 3: the
+# standard Skinner DAST-10 asks "Are you ALWAYS ABLE to stop using drugs when
+# you want to?" and reverse-scores it ('No' = 1). The study's interview script
+# flips the wording to "unable to stop", scored POSITIVELY ('Yes' = 1) — the
+# two are equivalent, but coding must follow the wording actually asked.
 DAST_10 = Instrument(
     key="dast_10",
     name="DAST-10 (drug use, non-alcohol)",
     domain="drugs",
     when_to_use="Positive drug pre-screen (illicit or non-medical prescription use).",
+    preamble="These questions refer to the past 12 months.",
     items=(
-        "Used drugs other than those required for medical reasons?",
-        "Abuse more than one drug at a time?",
-        "Always able to stop using drugs when you want to? (reverse-scored)",
-        "Had blackouts or flashbacks from drug use?",
-        "Feel bad or guilty about your drug use?",
-        "Does your spouse/parents ever complain about your drug use?",
-        "Neglected your family because of drug use?",
-        "Engaged in illegal activities to obtain drugs?",
-        "Experienced withdrawal symptoms when you stopped taking drugs?",
-        "Had medical problems as a result of your drug use?",
+        Item("Have you used drugs other than those required for medical "
+             "reasons?", _NO_YES),
+        Item("Do you abuse more than one drug at a time?", _NO_YES),
+        Item("Are you unable to stop using drugs when you want to?", _NO_YES,
+             note="study wording; standard DAST-10 asks 'always able to stop' reverse-scored"),
+        Item("Have you ever had blackouts or flashbacks as a result of drug "
+             "use?", _NO_YES),
+        Item("Do you ever feel bad or guilty about your drug use?", _NO_YES),
+        Item("Does your spouse (or parents) ever complain about your "
+             "involvement with drugs?", _NO_YES),
+        Item("Have you neglected your family because of your use of drugs?",
+             _NO_YES),
+        Item("Have you engaged in illegal activities in order to obtain "
+             "drugs?", _NO_YES),
+        Item("Have you ever experienced withdrawal symptoms (felt sick) when "
+             "you stopped taking drugs?", _NO_YES),
+        Item("Have you had medical problems as a result of your drug use "
+             "(e.g., memory loss, hepatitis, convulsions, bleeding)?", _NO_YES),
     ),
-    response_scale="Yes/No (item 3 is reverse-scored: 'No' = 1)",
+    response_scale="Yes/No, 1 point per problem answer",
     scoring="Count problem answers (0–10).",
+    # Zones per the study's app dialogue (feedback is keyed to these four).
+    # The standard Skinner banding splits 1-5 into low (1-2) / moderate (3-5);
+    # this study's protocol treats 1-5 as one "Risky" zone.
     bands=(
-        RiskBand("No problems reported", 0, 0, "Affirm, education"),
-        RiskBand("Low level", 1, 2, "Brief intervention (advice), monitor"),
-        RiskBand("Moderate level", 3, 5, "Brief intervention + brief treatment"),
-        RiskBand("Substantial level", 6, 8, "Refer for assessment"),
-        RiskBand("Severe level", 9, 10, "Refer to intensive assessment/treatment"),
+        RiskBand("Healthy (no problems reported)", 0, 0,
+                 "Affirm, education", zone="healthy"),
+        RiskBand("Risky", 1, 5,
+                 "Brief intervention (advice), monitor", zone="risky"),
+        RiskBand("Harmful", 6, 8,
+                 "Brief intervention + consider referral", zone="harmful"),
+        RiskBand("Dependent", 9, 10,
+                 "Refer to intensive assessment/treatment", zone="dependent"),
     ),
 )
 
@@ -231,3 +379,121 @@ BY_KEY = {ins.key: ins for ins in ALL_INSTRUMENTS}
 
 def render_catalog() -> str:
     return "\n\n".join(ins.render() for ins in ALL_INSTRUMENTS)
+
+# =====================================================================
+# Deterministic scoring — same file as the instrument data on purpose:
+# a reader sees the AUDIT/DAST items AND exactly how they turn into a
+# score + risk zone in one place. Pure functions, no LLM, no IO.
+#
+# A response set is {item_index: option_code} (both 0-based); the code is
+# the option's index in Item.options and its score is options[code].score
+# (AUDIT items 9-10: codes 0/1/2 score 0/2/4). WHO AUDIT Box 4 skip rules:
+#   item 1 == Never (0)      -> skip items 2-8, go to items 9-10
+#   items 2+3 total 0        -> skip items 4-8, go to items 9-10
+# Skipped items contribute 0, per the official form.
+# =====================================================================
+
+# AUDIT skip rules reference items by 0-based index.
+_AUDIT_Q1, _AUDIT_Q2, _AUDIT_Q3 = 0, 1, 2
+_AUDIT_SKIP_TO = 8  # items 9-10 (0-based 8-9)
+
+
+class InvalidResponse(ValueError):
+    """An item index or option code that does not exist on the instrument."""
+
+
+def _item(instrument: Instrument, item_index: int) -> Item:
+    try:
+        item = instrument.items[item_index]
+    except IndexError:
+        raise InvalidResponse(
+            f"{instrument.key} has no item {item_index}") from None
+    if not isinstance(item, Item):
+        raise InvalidResponse(
+            f"{instrument.key} item {item_index} is prompt-only reference "
+            f"data (plain string), not administrable")
+    return item
+
+
+def option_score(instrument: Instrument, item_index: int, code: int) -> int:
+    """Score contributed by answering `item_index` with option `code`.
+    Raises InvalidResponse for an unknown item or code — a coding layer bug
+    must surface, never silently score 0."""
+    item = _item(instrument, item_index)
+    if not 0 <= code < len(item.options):
+        raise InvalidResponse(
+            f"{instrument.key} item {item_index} has no option code {code} "
+            f"(valid: 0–{len(item.options) - 1})")
+    return item.options[code].score
+
+
+def _skipped_items(instrument: Instrument,
+                   responses: Mapping[int, int]) -> frozenset[int]:
+    """Item indexes that the official skip rules remove, given answers so far."""
+    if instrument.key != "audit":
+        return frozenset()
+    skipped: set[int] = set()
+    q1 = responses.get(_AUDIT_Q1)
+    if q1 is not None and option_score(instrument, _AUDIT_Q1, q1) == 0:
+        skipped.update(range(_AUDIT_Q2, _AUDIT_SKIP_TO))       # skip 2–8
+    q2, q3 = responses.get(_AUDIT_Q2), responses.get(_AUDIT_Q3)
+    if q2 is not None and q3 is not None:
+        total_23 = (option_score(instrument, _AUDIT_Q2, q2)
+                    + option_score(instrument, _AUDIT_Q3, q3))
+        if total_23 == 0:
+            skipped.update(range(_AUDIT_Q3 + 1, _AUDIT_SKIP_TO))  # skip 4–8
+    return frozenset(skipped)
+
+
+def next_item_index(instrument: Instrument,
+                    responses: Mapping[int, int]) -> int | None:
+    """The next item to administer, honoring skip rules; None when complete.
+    Items are asked in order; skipped items are never asked."""
+    skipped = _skipped_items(instrument, responses)
+    for i in range(len(instrument.items)):
+        if i in skipped or i in responses:
+            continue
+        return i
+    return None
+
+
+def is_complete(instrument: Instrument, responses: Mapping[int, int]) -> bool:
+    return next_item_index(instrument, responses) is None
+
+
+def total_score(instrument: Instrument, responses: Mapping[int, int]) -> int:
+    """Sum of contributed scores. Skipped items count 0 (official form).
+    Validates every recorded response."""
+    skipped = _skipped_items(instrument, responses)
+    return sum(option_score(instrument, i, code)
+               for i, code in responses.items() if i not in skipped)
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """The authoritative screening result for one instrument."""
+
+    instrument_key: str
+    score: int
+    complete: bool
+    band: RiskBand | None     # None only if score is out of any band's range
+
+    @property
+    def zone(self) -> str:
+        return self.band.zone if self.band else ""
+
+    @property
+    def action(self) -> str:
+        return self.band.action if self.band else ""
+
+
+def assess(instrument: Instrument, responses: Mapping[int, int]) -> Assessment:
+    """Compute the deterministic score + risk zone for the responses so far.
+    `complete=False` means items remain; the score is the running subtotal."""
+    score = total_score(instrument, responses)
+    return Assessment(
+        instrument_key=instrument.key,
+        score=score,
+        complete=is_complete(instrument, responses),
+        band=risk_band_for(instrument, score),
+    )
