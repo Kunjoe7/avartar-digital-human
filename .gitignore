@@ -1,6 +1,8 @@
 # Prompts
 CLAUDE.md
 SBIRT_Reference
+tests
+.pytest_cache/
 
 # Secrets
 .env

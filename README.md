@@ -60,6 +60,19 @@ cannot be down; an NLU-flagged crisis unions with it. Consent decisions land
 in an append-only audit log (`records/`); the audit record carries codes/
 scores/zones and capture KEYS only — never transcripts.
 
+**Turn-level safety patches**: score-critical items (AUDIT 1–6) whose answer
+was coded by semantic mapping are read back as the CODED option and held
+uncommitted until the person confirms — a "no" re-collects the item; exact-
+wording answers skip the read-back (T20). "Actually it's more like three
+times a week" corrects the earlier item, re-derives the skip landscape from
+the declarative rules, and logs old→new for audit (T21). "I'm done" anywhere
+closes gracefully with partial data kept and the abort recorded (T22). The
+authoritative session state is Fernet-encrypted to `records/sessions/` after
+every turn and keyed by the pseudonymous `sid`, so a crash or reconnect
+RESUMES at the pending question ("Welcome back…") instead of restarting
+(T24); the key comes from `SBIRT_STATE_KEY` or a generated
+`records/state.key` (move to a secrets manager for production).
+
 Server: Starlette + uvicorn (single port 17861, HTTP + two WebSocket routes).
 Frontend: `static/index.html`, plain HTML/JS, no build step.
 
@@ -137,6 +150,8 @@ All other settings live in `config.py`. Common knobs:
 | `VAD_THRESHOLD` | `0.5` | Silero VAD trigger threshold |
 | `VAD_SILENCE_DURATION` | `0.35` | Seconds of silence to mark sentence end |
 | `CONSENT_LOG_PATH` | `records/consent_log.jsonl` | Consent audit trail |
+| `SESSION_STATE_DIR` | `records/sessions/` | Encrypted per-sid session state (crash/reconnect resume) |
+| `SBIRT_STATE_KEY` | (generated `records/state.key`) | Fernet key for at-rest state; inject from a secrets manager in production |
 | `SYSTEM_PROMPT` | built from `modules/sbirt/` | Crisis-turn counselor prompt — **do not edit the string**; edit the clinical data modules under `modules/sbirt/` and it rebuilds automatically |
 
 Clinical content (questions, options, scores, zones, feedback wording) lives in
