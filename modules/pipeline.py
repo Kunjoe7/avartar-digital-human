@@ -568,6 +568,19 @@ class Pipeline:
                     # THE study consent (the greeting's ask) -> audit trail.
                     privacy.record_consent(
                         self.audit_key, "yes" if out.code == 1 else "no")
+                if exp.kind == "confirm":
+                    # T20: verdict on the read-back — yes commits the held
+                    # code, no re-collects the same item.
+                    step = runtime.resolve_confirm(clinical,
+                                                   yes=(out.code == 1))
+                    return self._deliver_step(user_text, step, turn,
+                                              ack=out.reply)
+                if runtime.needs_confirm(clinical, out):
+                    # T20: a semantically-coded answer to a score-critical
+                    # item is read back BEFORE it can commit.
+                    step = runtime.request_confirm(clinical, out)
+                    return self._deliver_step(user_text, step, turn,
+                                              ack=out.reply)
                 try:
                     step = runtime.advance(clinical, out)
                 except (runtime.ProtocolError, InvalidResponse):

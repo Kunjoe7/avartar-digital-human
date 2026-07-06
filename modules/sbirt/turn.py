@@ -69,6 +69,11 @@ class TurnOut(BaseModel):
     # tangent/continuation/unclear: the complete bounded response (answer
     # the person / acknowledge / clarify, then re-pose the current ask).
     reply: str = ""
+    # Set by the DETERMINISTIC pre-pass only (never trusted from model
+    # output — llm.turn force-clears it after parsing): the utterance was
+    # the option's exact wording, so a T20 confirm item commits without a
+    # read-back.
+    exact: bool = False
 
     @field_validator("reply", "text", mode="before")
     @classmethod
@@ -123,10 +128,10 @@ def validate(out: TurnOut, expect) -> TurnOut:
         return out
 
     kind = expect.kind
-    if kind == "consent":
+    if kind in ("consent", "confirm"):
         if out.code in (0, 1):
             return out
-        return _unclear(out, "consent needs yes(1)/no(0)")
+        return _unclear(out, f"{kind} needs yes(1)/no(0)")
     if kind == "option":
         item = expected_item(expect)
         if isinstance(out.code, int) and 0 <= out.code < len(item.options):

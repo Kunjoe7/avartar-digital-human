@@ -295,6 +295,10 @@ def _expectation_text(expect) -> str:
     kind = expect.kind
     if kind == "consent":
         return "A yes or no."
+    if kind == "confirm":
+        return ("A yes or no: you just read their previous answer back and "
+                "asked if you understood it right. 1 = confirmed, 0 = they "
+                "say it was wrong.")
     if kind == "option":
         item = expected_item(expect)
         lines = "\n".join(f"  {i}: {o.label}"
@@ -315,21 +319,23 @@ def _prepass(user_text: str, expect) -> TurnOut | None:
     """Zero-latency deterministic paths for unambiguous short answers.
     reply stays empty — skipping the acknowledgment beats guessing one."""
     t = " ".join(user_text.strip().lower().split()).rstrip(".!,")
-    if expect.kind == "consent":
+    if expect.kind in ("consent", "confirm"):
         if t in _CONSENT_YES:
-            return TurnOut(action="answer", code=1)
+            return TurnOut(action="answer", code=1, exact=True)
         if t in _CONSENT_NO:
-            return TurnOut(action="answer", code=0)
+            return TurnOut(action="answer", code=0, exact=True)
         return None
     if expect.kind == "option":
         code = _prematch_option(expected_item(expect).options, user_text)
         if code is not None:
-            return TurnOut(action="answer", code=code)
+            # exact=True: the utterance WAS the option's wording, so a T20
+            # confirm item commits without a read-back.
+            return TurnOut(action="answer", code=code, exact=True)
         return None
     if expect.kind == "number":
         got = code_number(user_text)
         if "value" in got:
-            return TurnOut(action="answer", code=got["value"])
+            return TurnOut(action="answer", code=got["value"], exact=True)
         return None
     return None
 
@@ -365,6 +371,9 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             if start == -1 or end <= start:
                 raise ValueError("no JSON object in turn output")
             out = TurnOut.model_validate_json(raw[start:end + 1])
+            # `exact` is the deterministic pre-pass's field: a model claiming
+            # it must never skip a T20 read-back.
+            out = out.model_copy(update={"exact": False})
             return validate_turn(out, expect)
         except Exception as e:
             # Log the exception TYPE only — a pydantic/JSON error message can

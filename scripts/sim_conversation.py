@@ -135,6 +135,18 @@ class TextSession:
             # fall through to the hold path (clarify which item they mean)
 
         if out.action == "answer":
+            if self.s.expect.kind == "confirm":
+                step = runtime.resolve_confirm(self.s, yes=(out.code == 1))
+                reply = self.speak(step.utterances, ack=out.reply)
+                self.transcript.append(
+                    ("avatar", reply, f"confirm→{self.s.node}"))
+                return reply, "confirm"
+            if runtime.needs_confirm(self.s, out):
+                step = runtime.request_confirm(self.s, out)
+                reply = self.speak(step.utterances, ack=out.reply)
+                self.transcript.append(
+                    ("avatar", reply, f"readback@{self.s.node}"))
+                return reply, "readback"
             step = runtime.advance(self.s, out)
             if self.s.node == "declined":
                 reply = config.DECLINE_TEXT
@@ -287,7 +299,9 @@ def scenario_full_bi(problems):
               "ok sure",                                   # education
               "yes that's fine",                           # AUDIT permission
               "two or three times a week",                 # item 1 -> 2/3
+              "yes",                                       # T20 read-back
               "three or four",                             # item 2
+              "yes",                                       # T20 read-back
               "less than monthly",                         # item 3
               "never",                                     # 4
               "less than monthly",                         # 5

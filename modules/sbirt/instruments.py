@@ -58,12 +58,18 @@ class Item:
     the conversational engine may add acknowledgment around it but never
     rephrase it. Open/number questions that are protocol conversation (not
     instrument items) live in the flow layer, not here.
+
+    `confirm=True` (T20) marks score-bearing items whose coded answer is read
+    back for a yes/no confirmation BEFORE it is committed — but only when the
+    code came from semantic (LLM) mapping; an answer spoken as the option's
+    exact wording commits directly. A "no" re-collects the item.
     """
 
     text: str
     options: tuple[Option, ...]
     note: str = ""  # skip rule / scoring deviation, rendered with the item
     verbatim: bool = True
+    confirm: bool = False
 
     @property
     def kind(self) -> str:
@@ -244,6 +250,11 @@ AUDIT = Instrument(
         "Now I am going to ask you some questions about your use of alcoholic "
         "beverages during this past year."
     ),
+    # confirm=True (T20): the quantity/frequency triad (items 1-3) and the
+    # dependence-domain items (4-6, per the manual's Box 2 domains) are the
+    # score-critical answers most exposed to semantic mis-coding, so an
+    # LLM-coded answer is read back before it commits. Which items carry the
+    # flag is a clinical coding decision — PENDING CLINICIAN REVIEW.
     items=(
         Item("How often do you have a drink containing alcohol?",
              (Option("Never", 0),
@@ -251,24 +262,26 @@ AUDIT = Instrument(
               Option("2 to 4 times a month", 2),
               Option("2 to 3 times a week", 3),
               Option("4 or more times a week", 4)),
-             note="0 (Never) → skip to items 9–10"),
+             note="0 (Never) → skip to items 9–10", confirm=True),
         Item("How many drinks containing alcohol do you have on a typical day "
              "when you are drinking?",
              (Option("1 or 2", 0),
               Option("3 or 4", 1),
               Option("5 or 6", 2),
               Option("7, 8, or 9", 3),
-              Option("10 or more", 4))),
+              Option("10 or more", 4)), confirm=True),
         Item("How often do you have six or more drinks on one occasion?",
              _FREQ_5,
-             note="if items 2+3 total 0 → skip to items 9–10"),
+             note="if items 2+3 total 0 → skip to items 9–10", confirm=True),
         Item("How often during the last year have you found that you were not "
-             "able to stop drinking once you had started?", _FREQ_5),
+             "able to stop drinking once you had started?", _FREQ_5,
+             confirm=True),
         Item("How often during the last year have you failed to do what was "
-             "normally expected from you because of drinking?", _FREQ_5),
+             "normally expected from you because of drinking?", _FREQ_5,
+             confirm=True),
         Item("How often during the last year have you needed a first drink in "
              "the morning to get yourself going after a heavy drinking session?",
-             _FREQ_5),
+             _FREQ_5, confirm=True),
         Item("How often during the last year have you had a feeling of guilt "
              "or remorse after drinking?", _FREQ_5),
         Item("How often during the last year have you been unable to remember "

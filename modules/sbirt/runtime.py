@@ -111,6 +111,9 @@ class ClinicalSession:
     answers: dict[str, str] = field(default_factory=dict)     # open captures (in-memory only)
     slots: dict[str, dict[str, str]] = field(default_factory=dict)  # slot captures
     last_ask_key: str | None = None            # target for continuation absorption
+    # T20: an LLM-coded answer to a confirm item, held here (uncommitted)
+    # until the person confirms the read-back: {instrument, item_index, code}.
+    pending_confirm: dict | None = None
     crisis: bool = False
     aborted: bool = False                      # user stopped the session (T22)
     last_step: Step | None = None
@@ -489,6 +492,60 @@ def advance(session: ClinicalSession, out: TurnOut) -> Step:
         raise ProtocolError(
             f"advance() only takes validated answers, got {out.action!r}")
     _consume(session, out)
+    return _run(session, [])
+
+
+def needs_confirm(session: ClinicalSession, out: TurnOut) -> bool:
+    """True when this validated answer must be read back before committing
+    (T20): an instrument item marked confirm, coded by SEMANTIC mapping (the
+    deterministic exact-wording pre-pass sets out.exact and skips this)."""
+    exp = session.expect
+    if (exp.kind != "option" or not exp.instrument
+            or exp.instrument == "prescreen" or out.exact):
+        return False
+    item = BY_KEY[exp.instrument].items[exp.item_index]
+    return item.confirm and isinstance(out.code, int)
+
+
+def request_confirm(session: ClinicalSession, out: TurnOut) -> Step:
+    """Hold a confirm item's coded answer UNCOMMITTED and ask the person to
+    verify the read-back (T20). The read-back speaks the CODED option label,
+    never a paraphrase of their raw words — the point is to surface a
+    mis-coding while it can still be fixed."""
+    exp = session.expect
+    item = BY_KEY[exp.instrument].items[exp.item_index]
+    label = item.options[out.code].label
+    session.pending_confirm = {"instrument": exp.instrument,
+                               "item_index": exp.item_index,
+                               "code": out.code}
+    instruction = (
+        f"You understood the person's answer to {item.text!r} as: {label!r}. "
+        "In ONE short natural sentence, say that understanding back to them "
+        "and ask if that's right (a yes/no). Do not re-ask the question "
+        "itself and do not suggest a different answer.")
+    return _pause(session, f"confirm.{exp.instrument}.{exp.item_index}",
+                  [LLMSay(instruction)],
+                  Expect("confirm", instrument=exp.instrument,
+                         item_index=exp.item_index))
+
+
+def resolve_confirm(session: ClinicalSession, yes: bool) -> Step:
+    """Consume the yes/no verdict on a read-back: yes commits the held code
+    and the protocol moves on; no discards it and the SAME item is re-posed
+    for a fresh answer. Either way the machine stays deterministic — the
+    paused RunItems step recomputes what to ask next."""
+    pending = session.pending_confirm
+    session.pending_confirm = None
+    if pending is None:
+        raise ProtocolError("confirm resolution without a pending answer")
+    if yes:
+        session.responses.setdefault(
+            pending["instrument"], {})[pending["item_index"]] = pending["code"]
+        logger.info("[clinical] confirm accepted: %s item %d",
+                    pending["instrument"], pending["item_index"])
+    else:
+        logger.info("[clinical] confirm DENIED: %s item %d re-collected",
+                    pending["instrument"], pending["item_index"])
     return _run(session, [])
 
 
