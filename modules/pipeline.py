@@ -11,7 +11,7 @@ import re
 import config
 from modules import asr, llm, tts, avatar, privacy
 from modules.privacy import phi, phi_keys
-from modules.sbirt import crisis, runtime
+from modules.sbirt import crisis, runtime, templates
 from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
 
 logger = logging.getLogger(__name__)
@@ -452,7 +452,7 @@ class Pipeline:
         discussed the standard drink?') be answered honestly from state
         instead of re-asking the machine's own question."""
         c = self.clinical
-        return {
+        facts = {
             "current_phase": c.node,
             "standard_drink_definition_discussed":
                 "alcohol.edu.standard_drink" in c.covered,
@@ -460,6 +460,16 @@ class Pipeline:
             "permissions_declined_so_far": list(c.declined),
             "active_topic": c.arm,
         }
+        # Content of the education actually delivered, so a "you spoke too
+        # fast / say that again" turn can honestly re-give the key facts
+        # instead of ignoring the request (the facts block is the reply's
+        # ONLY permitted factual source).
+        for unit_key, fact_key in (
+                ("alcohol.edu.standard_drink", "standard_drink_definition"),
+                ("alcohol.edu.limits", "recommended_drinking_limits")):
+            if unit_key in c.covered:
+                facts[fact_key] = templates.FIXED[unit_key]
+        return facts
 
     def _protocol_turn(self, user_text, turn):
         """ONE NLU+voice call classifies the utterance relative to the current
@@ -561,15 +571,17 @@ class Pipeline:
                 instruction = (
                     "The person's answer didn't clearly match one of the "
                     f"answer choices. In one or two short sentences, gently "
-                    f"re-ask: {q!r} — you may briefly mention the choices "
+                    f"re-ask the substance of {q!r} IN DIFFERENT WORDS than "
+                    f"before — you may briefly mention the choices "
                     f"({labels}). Do not suggest which one to pick.")
             elif exp.kind == "number":
                 instruction = ("In one short sentence, gently ask again for "
                                "a single number from 0 to 10.")
             else:
                 instruction = (f"The person's answer to {question!r} wasn't "
-                               "clear. In one short sentence, gently ask "
-                               "again.")
+                               "clear. In one short sentence, ask again in "
+                               "different words than the question was asked "
+                               "before.")
             utterance = runtime.LLMSay(instruction)
         self._deliver_step(
             user_text,

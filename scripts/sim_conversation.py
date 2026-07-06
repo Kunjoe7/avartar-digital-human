@@ -2,7 +2,7 @@
 scripted user at the TEXT layer (no ASR/TTS/FLOAT — those are byte-identical
 delivery, not conversation logic).
 
-Two scenarios:
+Three scenarios:
   1. REPLAY of the field transcript that motivated the refactor (whiskey /
      twelve ounces in two breaths, education declined, "have we ever
      discussed the standard drink definition?", declines more questions) —
@@ -10,6 +10,11 @@ Two scenarios:
   2. A full conversational alcohol-BI walk with non-label phrasings, so the
      LLM (not the pre-match) does real coding — asserts the deterministic
      score/zone and the one-question-per-turn rule.
+  3. REPLAY of the second field transcript (2026-07, "ten twenty times" /
+     "more than one" / "you spoke too fast") — asserts codable answers are
+     coded first try, vague or wrong-dimension answers are clarified (never
+     captured), nothing is re-asked word-for-word, and a repeat request is
+     answered instead of ignored.
 
 Needs OPENROUTER_API_KEY (network). Run:  python scripts/sim_conversation.py
 """
@@ -21,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config                                             # noqa: E402
 from modules import llm                                   # noqa: E402
-from modules.sbirt import crisis, runtime                 # noqa: E402
+from modules.sbirt import crisis, runtime, templates      # noqa: E402
 from modules.sbirt.runtime import LLMSay, Say, Speak      # noqa: E402
 
 
@@ -38,7 +43,7 @@ class TextSession:
 
     def facts(self):
         c = self.s
-        return {
+        facts = {
             "current_phase": c.node,
             "standard_drink_definition_discussed":
                 "alcohol.edu.standard_drink" in c.covered,
@@ -46,6 +51,12 @@ class TextSession:
             "permissions_declined_so_far": list(c.declined),
             "active_topic": c.arm,
         }
+        for unit_key, fact_key in (
+                ("alcohol.edu.standard_drink", "standard_drink_definition"),
+                ("alcohol.edu.limits", "recommended_drinking_limits")):
+            if unit_key in c.covered:
+                facts[fact_key] = templates.FIXED[unit_key]
+        return facts
 
     def last_ask(self):
         step = self.s.last_step
@@ -179,6 +190,63 @@ def scenario_replay(problems):
           problems)
 
 
+def scenario_field_2(problems):
+    print("=" * 72)
+    print("SCENARIO 3 — replay of the second field transcript "
+          "(ten-twenty times / more than one / spoke too fast)")
+    print("=" * 72)
+    t = TextSession()
+    t.user("yes")
+    t.user("yes i do")                             # tobacco +
+    t.user("yesterday")                            # alcohol + (last year)
+    # Defect: "about ten twenty times" was clarified TWICE instead of being
+    # coded as "One or more" (it fits exactly one option).
+    r, a = t.user("about ten twenty times")
+    check(a == "answer" and t.s.prescreen.get("drugs") == 1,
+          "codable range answer coded FIRST try (ten-twenty -> one-or-more)",
+          problems)
+    if t.s.prescreen.get("drugs") != 1:            # recover to keep replaying
+        t.user("one or more")
+    t.user("i like whiskey a lot")                 # qf drink slot
+    # Defect: "maybe ten twenty times" (TIMES, asked for DRINKS) was met with
+    # the question re-read word-for-word; then "more than one" was captured.
+    ask_before = t.transcript[-1][1]
+    r1, a1 = t.user("maybe ten twenty times")
+    amount_after_times = t.s.slots.get("alcohol.qf", {}).get("amount")
+    check(amount_after_times is None,
+          "wrong-dimension answer (times for drinks) NOT captured as amount",
+          problems)
+    check(r1.strip() and r1.strip() != ask_before.strip(),
+          "clarification is not the question re-read word-for-word", problems)
+    r2, a2 = t.user("more than one")
+    check(t.s.slots.get("alcohol.qf", {}).get("amount") is None,
+          "vague 'more than one' NOT captured as a usable amount", problems)
+    t.user("maybe ten drinks")                     # usable amount
+    check(bool(t.s.slots.get("alcohol.qf", {}).get("amount")),
+          "usable amount captured after clarification", problems)
+    t.user("every day i'm a big addict")           # frequency
+    t.user("yeah sure")                            # education permission
+    node_before = t.s.node
+    # Defect: "you spoke too fast" was ignored — the fixed permission line
+    # was simply re-posed verbatim.
+    r3, a3 = t.user("oh my gosh you spoke too fast i just cannot remember it")
+    perm_line = templates.FIXED["alcohol.screen.permission"]
+    check(t.s.node == node_before, "repeat request holds the machine", problems)
+    check(r3.strip() and r3.strip() != perm_line
+          and (a3 in ("question", "tangent") or "drink" in r3.lower()),
+          "repeat request gets a real response, not the verbatim re-pose",
+          problems)
+    t.user("yes")                                  # AUDIT permission
+    t.dump()
+    check(t.s.node.startswith("screening.audit"),
+          "protocol reaches AUDIT item 1 after the detour", problems)
+    seen = [txt for who, txt, n in t.transcript if who == "avatar"]
+    dup = any(x.strip() and x.strip() == y.strip()
+              for x, y in zip(seen, seen[1:]))
+    check(not dup, "no avatar turn repeats the previous one verbatim",
+          problems)
+
+
 def scenario_full_bi(problems):
     print("=" * 72)
     print("SCENARIO 2 — full alcohol BI walk, conversational answers")
@@ -237,6 +305,8 @@ if __name__ == "__main__":
     scenario_replay(problems)
     print()
     scenario_full_bi(problems)
+    print()
+    scenario_field_2(problems)
     print("\n" + "=" * 72)
     if problems:
         print(f"RESULT: {len(problems)} CHECK(S) FAILED")
