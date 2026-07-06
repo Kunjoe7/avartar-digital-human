@@ -1,31 +1,64 @@
 # Digital Human SBIRT Screener
 
 Real-time digital human for SBIRT alcohol/drug screening: browser mic capture
-→ VAD segmentation (+ smart-turn EOU) → ASR → **deterministic clinical state
-machine** → cached fixed clips / bounded LLM utterances → FLOAT talking-head
-video. Supports user barge-in (interrupting the avatar mid-response).
+→ VAD segmentation (+ smart-turn EOU) → ASR → **generic turn engine over a
+declarative protocol program** (deterministic control) + **one LLM call per
+turn** (understanding + this turn's voice) → cached fixed clips / dynamic
+short renders → FLOAT talking-head video. Supports user barge-in
+(interrupting the avatar mid-response).
 
 ## Architecture
 
+The split that everything else hangs off: **the deterministic spine decides
+WHAT happens next; the LLM only decides HOW this one turn sounds.**
+
 ```
 Browser mic ─WS /ws/audio─▶ VAD(+EOU) ─speech_end─▶ Pipeline
-Pipeline: ASR ─▶ crisis net (deterministic) ─▶ NLU coder (option/number/consent)
-          ─▶ clinical state machine (modules/sbirt/runtime.py)
-          ─▶ fixed utterances: pre-rendered cached clips (assets/clips/)
-             LLM utterances: bounded single-sentence phrasing ─▶ TTS ─▶ FLOAT
+Pipeline: ASR ─▶ crisis net (deterministic, runs first)
+          ─▶ llm.turn() — ONE call: classify the utterance relative to the
+             current ask (answer/continuation/question/tangent/crisis/unclear),
+             code it if it's an answer, produce this turn's bounded reply
+          ─▶ turn.validate — pure gatekeeper: an illegal answer degrades to
+             'unclear'; ONLY a validated answer may advance the engine
+          ─▶ generic engine (runtime.py) executing flow.PROTOCOL:
+               answer        → advance; speak ack + next step's beats
+               continuation  → absorb into the previous capture; HOLD
+               question      → answer THEM from state facts; re-ask; HOLD
+               tangent       → acknowledge, return to the ask; HOLD
+               crisis        → pause the protocol permanently (union w/ net)
+               unclear       → gentle re-ask; HOLD
+          ─▶ beats: Say  = verbatim study text → pre-rendered cached clip
+                    Speak = the ack (dynamic, rides the low-NFE fast path)
+                    LLMSay= composed ask/summary → phrase → TTS → FLOAT
 WS(/ws/state) pushes the next video segment and subtitle to the frontend
 Barge-in: VAD/ASR speech_start ─▶ cancel_event + turn bump ─▶ clear queue
 ```
 
+**The protocol is data, not handlers** (`modules/sbirt/flow.py`): the whole
+study session — consent gate, 3-question pre-screen, alcohol/drug arms,
+AUDIT/DAST administration, zone feedback, brief intervention, closes — is ONE
+step program (`Gate / Ask / Tell / RunItems / Route / End`) executed by a
+single interpreter in `runtime.py`. There is no per-question code: adding a
+question = adding an instrument `Item` or a flow step. Open questions are
+never discarded — every capture lands in session state; the alcohol Q/F is a
+slot-ask (drink/amount/frequency) that asks ONE missing slot at a time and
+holds through multi-breath answers.
+
 **Deterministic clinical core** (`modules/sbirt/`): AUDIT/DAST scores, risk
-zones, question order/skip rules, arm routing and zone feedback are computed
-by code (`instruments.py` + `runtime.py` + `templates.py`),
-never by the LLM. The LLM's jobs are narrow: coding free-text answers onto
-option codes (with AMBIGUOUS → clarification, never guessing), and phrasing
-single bounded utterances (reflections/summaries). A deterministic crisis
-keyword net (`crisis.py`) runs before everything and cannot be down. Consent
-decisions land in an append-only audit log (`records/`). See
-`DECISIONS_FOR_REVIEW.md` for open clinical/compliance decision points.
+zones, question order/skip rules (declarative `SkipRule` data on each
+instrument), arm routing and zone feedback are computed by code
+(`instruments.py` + `flow.py` + `runtime.py`), never by the LLM. The LLM's
+output enters the engine ONLY as a `turn.TurnOut` validated against the
+current expectation (guess-free: an undetermined timeframe/quantity degrades
+to a clarification, never a code). Wording is state-honest: lines that
+reference earlier content (e.g. "the standard drink definition we just
+discussed") have variants picked from what was ACTUALLY delivered
+(`session.covered`), and the close is assembled from the real path taken
+(declined sessions never get promised "a few more questions"). A
+deterministic crisis keyword net (`crisis.py`) runs before everything and
+cannot be down; an NLU-flagged crisis unions with it. Consent decisions land
+in an append-only audit log (`records/`); the audit record carries codes/
+scores/zones and capture KEYS only — never transcripts.
 
 Server: Starlette + uvicorn (single port 17861, HTTP + two WebSocket routes).
 Frontend: `static/index.html`, plain HTML/JS, no build step.
@@ -95,7 +128,7 @@ All other settings live in `config.py`. Common knobs:
 
 | Setting | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `google/gemini-2.5-flash` | OpenRouter model (NLU coding + bounded utterances) |
+| `LLM_MODEL` | `google/gemini-2.5-flash` | OpenRouter model (the per-turn NLU+voice call, bounded utterances, crisis chat) |
 | `TTS_VOICE` | `en-US-GuyNeural` | edge-tts voice |
 | `ASR_MODEL` | `iic/SenseVoiceSmall` | FunASR model |
 | `FLOAT_GPUS` | `[3]` | GPUs used by FLOAT (list; parallel across entries) |
@@ -118,10 +151,16 @@ cached clip automatically (sidecar text check).
 python -m pytest tests/ -q
 # Full suite incl. real-Pipeline integration (needs the float env's deps):
 ~/.conda/envs/float/bin/python -m pytest tests/ -q
+# Conversation-quality acceptance at the text layer (REAL LLM, no GPU stack;
+# replays the field transcript that motivated the turn-engine refactor):
+python scripts/sim_conversation.py
 ```
 
 Gold-standard fixtures under `tests/fixtures/` are hand-scored from the case
-cards in `SBIRT_Reference/` — fix code, never fixtures.
+cards in `SBIRT_Reference/` — fix code, never fixtures. The float-env suite
+also locks the generation budget: a full session renders dynamic clips only
+for the acks/composed asks/BI summaries — fixed content plays from
+`assets/clips/` with ZERO runtime FLOAT renders.
 
 ## Running
 
