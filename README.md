@@ -36,25 +36,28 @@ Frontend: `static/index.html`, plain HTML/JS, no build step.
 digital-human/
 ├── main.py                  # Starlette entrypoint (HTTP + WS), per-sid sessions
 ├── config.py                # All configuration (GPU allocation, models, prompt, ...)
-├── DECISIONS_FOR_REVIEW.md  # Open clinical/compliance decision points
 ├── modules/
-│   ├── pipeline.py          # Orchestration: ASR → coder → machine → clips/TTS/FLOAT
+│   ├── pipeline.py          # Orchestration: ASR → turn NLU → engine → clips/TTS/FLOAT
 │   ├── vad.py               # Silero VAD real-time segmentation
 │   ├── eou.py               # smart-turn v3 semantic end-of-utterance (CPU ONNX)
 │   ├── asr.py               # FunASR (SenseVoiceSmall)
-│   ├── llm.py               # OpenRouter: NLU coding + bounded utterances (+ crisis chat)
+│   ├── llm.py               # OpenRouter: the per-turn NLU+voice call + bounded utterances (+ crisis chat)
 │   ├── tts.py               # edge-tts (en-US-GuyNeural)
 │   ├── avatar.py            # FLOAT GPU pool + idle video
 │   ├── privacy.py           # PHI-safe logging (no opt-out) + consent audit trail
 │   └── sbirt/               # SBIRT clinical framework — the deterministic core
 │       ├── instruments.py   #   structured tools + deterministic scoring in one file
-│       ├── runtime.py       #   the executable clinical state machine
-│       ├── templates.py     #   versioned verbatim script (questions/feedback/BI)
+│       ├── flow.py          #   the study protocol as ONE declarative step program
+│       ├── runtime.py       #   the generic turn engine executing flow.PROTOCOL
+│       ├── turn.py          #   TurnOut: the validated per-turn NLU contract
+│       ├── templates.py     #   verbatim script + content units (questions/feedback/BI)
 │       ├── crisis.py        #   deterministic crisis keyword net + fixed responses
 │       ├── intervention.py  #   MI/OARS, FRAMES, stages of change (prompt data)
 │       ├── referral.py      #   ASAM levels, MAT, resources, crisis protocol (prompt data)
 │       ├── workflow.py      #   conceptual SBIRT node map (prompt data)
 │       └── prompt.py        #   build_system_prompt() — now used for crisis turns
+├── scripts/
+│   └── sim_conversation.py  # text-layer acceptance sim (real LLM, no GPU stack)
 ├── tests/                   # pytest: gold-standard case cards + integration
 ├── static/
 │   ├── index.html           # Frontend UI
@@ -71,7 +74,9 @@ digital-human/
 
 - Upstream model repo: [FLOAT](https://github.com/deepbrainai-research/float). Place it in a sibling directory at `../float/`, with the checkpoint at `../float/checkpoints/float.pth` (run `download_checkpoints.sh` to fetch it).
 - Python: conda env `float` (Python 3.10), PyTorch 2.6.0+cu118, transformers 4.49, numpy<2.
-- Hardware: 4× A100 80GB (GPUs 0/1/2 for FLOAT parallel rendering, GPU 3 for ASR).
+- Hardware: CUDA GPU(s); the defaults put FLOAT and ASR together on GPU 3
+  (`config.FLOAT_GPUS` / `config.ASR_GPU` — list more GPUs in `FLOAT_GPUS`
+  to render sentence clips in parallel).
 - ffmpeg (already installed inside the `float` conda env).
 
 ```bash
@@ -93,8 +98,8 @@ All other settings live in `config.py`. Common knobs:
 | `LLM_MODEL` | `google/gemini-2.5-flash` | OpenRouter model (NLU coding + bounded utterances) |
 | `TTS_VOICE` | `en-US-GuyNeural` | edge-tts voice |
 | `ASR_MODEL` | `iic/SenseVoiceSmall` | FunASR model |
-| `FLOAT_GPUS` | `[2]` | GPUs used by FLOAT (list; parallel across entries) |
-| `ASR_GPU` | `2` | GPU for ASR (currently shared with FLOAT) |
+| `FLOAT_GPUS` | `[3]` | GPUs used by FLOAT (list; parallel across entries) |
+| `ASR_GPU` | `3` | GPU for ASR (currently shared with FLOAT) |
 | `FLOAT_NFE` | `10` | FLOAT inference steps (lower = faster) |
 | `VAD_THRESHOLD` | `0.5` | Silero VAD trigger threshold |
 | `VAD_SILENCE_DURATION` | `0.35` | Seconds of silence to mark sentence end |
@@ -103,8 +108,8 @@ All other settings live in `config.py`. Common knobs:
 
 Clinical content (questions, options, scores, zones, feedback wording) lives in
 `modules/sbirt/instruments.py` + `templates.py`, sourced verbatim from the
-study documents in `SBIRT_Reference/`. Changing any fixed text bumps the clip
-cache automatically (sidecar text check) — bump `templates.SCRIPT_VERSION` too.
+study documents in `SBIRT_Reference/`. Changing any fixed text regenerates its
+cached clip automatically (sidecar text check).
 
 ## Tests
 

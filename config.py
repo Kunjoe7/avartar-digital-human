@@ -54,8 +54,8 @@ TTS_VOICE = "en-US-GuyNeural"
 ASR_MODEL = "iic/SenseVoiceSmall"
 
 # GPU allocation
-FLOAT_GPUS = [3]    # 3 GPUs for FLOAT parallel rendering
-ASR_GPU = 3         # Dedicated GPU for ASR
+FLOAT_GPUS = [3]    # GPUs FLOAT renders on (one worker per listed GPU id)
+ASR_GPU = 3         # GPU for ASR (currently shared with FLOAT)
 
 # FLOAT
 FLOAT_NFE = 10            # Number of function evaluations (lower = faster, 7-10)

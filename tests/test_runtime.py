@@ -8,7 +8,7 @@ import os
 import pytest
 
 from modules.sbirt import runtime, templates
-from modules.sbirt.runtime import ClinicalSession, LLMSay, Say, Speak
+from modules.sbirt.runtime import ClinicalSession, LLMSay, Say
 from modules.sbirt.turn import TurnOut, validate
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
