@@ -338,7 +338,11 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             out = TurnOut.model_validate_json(raw[start:end + 1])
             return validate_turn(out, expect)
         except Exception as e:
-            logger.info("turn() attempt %d failed (%s)", attempt + 1, e)
+            # Log the exception TYPE only — a pydantic/JSON error message can
+            # embed the raw model output, which may quote the user (no-PHI
+            # logs is a non-negotiable).
+            logger.info("turn() attempt %d failed (%s)",
+                        attempt + 1, type(e).__name__)
             messages.append({"role": "user", "content":
                              "Your last output was invalid. Output ONLY the "
                              "JSON object described, nothing else."})

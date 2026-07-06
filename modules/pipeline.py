@@ -112,6 +112,9 @@ class Pipeline:
         # Set when the user declines consent: the server then turns the mic off and
         # tells the client to stop, ending the session until Start is pressed again.
         self.ended = False
+        # Dynamic (non-cached) TTS+FLOAT renders this session — the generation
+        # budget observable (T18). Fixed content contributes zero at runtime.
+        self.dynamic_renders = 0
         # THE clinical state: protocol node, coded answers, deterministic
         # scores/zones, readiness. The machine (modules/sbirt/runtime.py)
         # decides every transition; the LLM never does.
@@ -574,7 +577,12 @@ class Pipeline:
             turn)
 
     def _render_dynamic(self, text):
-        """TTS + FLOAT for a non-cached utterance; None on failure/cancel."""
+        """TTS + FLOAT for a non-cached utterance; None on failure/cancel.
+        Counts every dynamic render (T18): fixed content must stay at zero
+        runtime renders, so this counter IS the session's generation budget."""
+        self.dynamic_renders += 1
+        logger.info("[latency] dynamic render #%d this session",
+                    self.dynamic_renders)
         tts_path = tts.synthesize(text, None, self.cancel_event)
         if tts_path is None:
             return None

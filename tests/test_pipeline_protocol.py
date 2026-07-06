@@ -313,6 +313,8 @@ def test_generation_budget_full_session(pipeline, monkeypatch):
     # utterances (decisional-balance summary, ruler summary, closing
     # reflection). Fixed content: 0 renders.
     assert len(renders) == 6, f"FLOAT ran {len(renders)}x; budget is 6"
+    # The runtime observable must agree with the ground truth (T18).
+    assert p.dynamic_renders == 6
 
 
 def test_every_protocol_clip_is_prewarmed(pipeline, monkeypatch):
