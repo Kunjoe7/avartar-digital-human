@@ -16,17 +16,23 @@ WHAT happens next; the LLM only decides HOW this one turn sounds.**
 Browser mic ─WS /ws/audio─▶ VAD(+EOU) ─speech_end─▶ Pipeline
 Pipeline: ASR ─▶ crisis net (deterministic, runs first)
           ─▶ llm.turn() — ONE call: classify the utterance relative to the
-             current ask (answer/continuation/question/tangent/crisis/unclear),
-             code it if it's an answer, produce this turn's bounded reply
+             current ask (answer/continuation/question/tangent/crisis/
+             abort/correction/unclear), code it if it's an answer, produce
+             this turn's bounded reply
           ─▶ turn.validate — pure gatekeeper: an illegal answer degrades to
              'unclear'; ONLY a validated answer may advance the engine
           ─▶ generic engine (runtime.py) executing flow.PROTOCOL:
                answer        → advance; speak ack + next step's beats
+                               (confirm-flagged items: read back the CODED
+                               option first; commit only on the yes)
                continuation  → absorb into the previous capture; HOLD
                question      → answer THEM from state facts; re-ask; HOLD
                tangent       → acknowledge, return to the ask; HOLD
+               correction    → overwrite the earlier item; re-derive skips
+                               and score; audit old→new; re-pose the ask
+               abort         → graceful close, partial data kept, mic off
                crisis        → pause the protocol permanently (union w/ net)
-               unclear       → gentle re-ask; HOLD
+               unclear       → clarify toward the candidate options; HOLD
           ─▶ beats: Say  = verbatim study text → pre-rendered cached clip
                     Speak = the ack (dynamic, rides the low-NFE fast path)
                     LLMSay= composed ask/summary → phrase → TTS → FLOAT
@@ -90,7 +96,7 @@ digital-human/
 │   ├── llm.py               # OpenRouter: the per-turn NLU+voice call + bounded utterances (+ crisis chat)
 │   ├── tts.py               # edge-tts (en-US-GuyNeural)
 │   ├── avatar.py            # FLOAT GPU pool + idle video
-│   ├── privacy.py           # PHI-safe logging (no opt-out) + consent audit trail
+│   ├── privacy.py           # PHI-safe logging (no opt-out) + consent audit + encrypted session state
 │   └── sbirt/               # SBIRT clinical framework — the deterministic core
 │       ├── instruments.py   #   structured tools + deterministic scoring in one file
 │       ├── flow.py          #   the study protocol as ONE declarative step program
@@ -179,8 +185,10 @@ python -m pytest tests/ -q
 # Full suite incl. real-Pipeline integration (needs the float env's deps):
 ~/.conda/envs/float/bin/python -m pytest tests/ -q
 # Conversation-quality acceptance at the text layer (REAL LLM, no GPU stack;
-# replays the field transcript that motivated the turn-engine refactor —
-# this one IS tracked in the repo):
+# this one IS tracked in the repo). Three scenarios: replays of BOTH field
+# transcripts that motivated fixes (the rigid-dialogue one and the
+# "ten twenty times / more than one / you spoke too fast" one) plus a full
+# conversational alcohol-BI walk incl. the T20 read-backs:
 python scripts/sim_conversation.py
 ```
 
@@ -226,3 +234,6 @@ On startup:
 - `numpy` must be <2, `opencv-python` must be <4.11.
 - `edge-tts` is async; when calling from a synchronous thread you need `asyncio.run` or a thread pool. See `modules/tts.py`.
 - On first launch, `assets/idle_loop.mp4` is auto-generated if missing — this requires the FLOAT checkpoint to already be in place.
+- Losing `records/state.key` (when no `SBIRT_STATE_KEY` is set) makes every
+  persisted session state unreadable — sessions then silently start fresh.
+  Back the key up, or inject it via `SBIRT_STATE_KEY`.
