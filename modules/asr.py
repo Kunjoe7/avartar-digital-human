@@ -1,19 +1,25 @@
 import re
+import threading
 import numpy as np
 from funasr import AutoModel
 import config
 
 _model = None
+_model_lock = threading.Lock()
 
 
 def get_model():
     global _model
+    # Double-checked locking so a startup pre-warm and a concurrent first request
+    # don't both build the model (double GPU load).
     if _model is None:
-        _model = AutoModel(
-            model=config.ASR_MODEL,
-            device=f"cuda:{config.ASR_GPU}",
-            trust_remote_code=True,
-        )
+        with _model_lock:
+            if _model is None:
+                _model = AutoModel(
+                    model=config.ASR_MODEL,
+                    device=f"cuda:{config.ASR_GPU}",
+                    trust_remote_code=True,
+                )
     return _model
 
 

@@ -17,6 +17,7 @@ from generate import InferenceAgent
 logger = logging.getLogger(__name__)
 
 _pool = None
+_pool_lock = threading.Lock()
 
 
 def _build_opt(gpu_id: int, nfe: int = config.FLOAT_NFE):
@@ -98,27 +99,50 @@ class FloatGPUPool:
         logger.info(f"FLOAT GPU pool ready: {list(self.agents.keys())}")
 
     def generate_video(self, audio_path: str, ref_image: str | None = None,
-                       output_path: str | None = None) -> str:
-        """Generate video using any available GPU from the pool."""
+                       output_path: str | None = None, nfe: int | None = None) -> str:
+        """Generate video using any available GPU from the pool.
+
+        nfe overrides the number of FLOAT function evaluations for this clip only
+        (lower = faster, slightly lower quality); defaults to config.FLOAT_NFE.
+
+        KNOWN LIMIT (documented, not fixable here): FLOAT's ODE sampler lives in
+        the external float/ repo (off-limits to this project), so a single
+        run_inference() call cannot be cancelled mid-sampling — a barge-in only
+        takes effect between clips. Mitigation: low NFE (config.FLOAT_NFE /
+        FLOAT_NFE_FIRST) keeps each clip's render short, and since the protocol
+        rewrite all fixed content is pre-rendered, so runtime renders are rare.
+        """
         if ref_image is None:
             ref_image = config.AVATAR_IMAGE
         if output_path is None:
             output_path = tempfile.mktemp(suffix=".mp4", dir=config.TEMP_DIR)
+        if nfe is None:
+            nfe = config.FLOAT_NFE
 
         # Try to acquire any GPU
         while True:
+            # Bail out promptly on server shutdown so Ctrl+C isn't blocked waiting
+            # here for a free GPU (the caller treats None as a failed render).
+            if config.SHUTTING_DOWN.is_set():
+                return None
             for gpu_id in self.gpu_ids:
                 if self.semaphores[gpu_id].acquire(blocking=False):
                     try:
                         agent = self.agents[gpu_id]
-                        result = agent.run_inference(
-                            res_video_path=output_path,
-                            ref_path=ref_image,
-                            audio_path=audio_path,
-                            no_crop=True,
-                            nfe=config.FLOAT_NFE,
-                            verbose=True,
-                        )
+                        # Pin the current CUDA device for this thread so any
+                        # device-less tensor creation inside FLOAT (e.g. the bare
+                        # `.cuda()` in styledecoder.py) lands on THIS gpu instead
+                        # of the default cuda:0. Without this, segments dispatched
+                        # to GPU 1/2 crash with "tensors on cuda:1 and cuda:0".
+                        with torch.cuda.device(gpu_id):
+                            result = agent.run_inference(
+                                res_video_path=output_path,
+                                ref_path=ref_image,
+                                audio_path=audio_path,
+                                no_crop=True,
+                                nfe=nfe,
+                                verbose=True,
+                            )
                         return result
                     finally:
                         self.semaphores[gpu_id].release()
@@ -178,16 +202,22 @@ class FloatGPUPool:
 
 def get_pool() -> FloatGPUPool:
     global _pool
+    # Double-checked locking: build the pool FULLY (load_all) before publishing it
+    # to `_pool`. Otherwise concurrent callers during the ~10s cold load would see
+    # a half-built pool with empty `agents`/`semaphores` -> KeyError on gpu_id.
     if _pool is None:
-        _pool = FloatGPUPool()
-        _pool.load_all()
+        with _pool_lock:
+            if _pool is None:
+                pool = FloatGPUPool()
+                pool.load_all()
+                _pool = pool
     return _pool
 
 
 def generate_video(audio_path: str, ref_image: str | None = None,
-                   output_path: str | None = None) -> str:
+                   output_path: str | None = None, nfe: int | None = None) -> str:
     """Public API - uses the GPU pool."""
-    return get_pool().generate_video(audio_path, ref_image, output_path)
+    return get_pool().generate_video(audio_path, ref_image, output_path, nfe=nfe)
 
 
 def generate_idle_video(duration: float = 3.0) -> str:
