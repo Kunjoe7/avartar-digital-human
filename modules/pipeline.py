@@ -8,6 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, Future
 
 import re
+import numpy as np
+
 import config
 from modules import asr, llm, tts, avatar, privacy
 from modules.privacy import phi, phi_keys
@@ -135,15 +137,49 @@ class Pipeline:
         # perf_counter() at the moment the user stopped speaking — the T0 for the
         # latency waterfall logged through the rest of the turn.
         self._t0 = 0.0
+        # Pause-split continuation merge (voice): remember the in-flight
+        # utterance's audio until the machine ACTS on its words; if new
+        # speech supersedes the turn first, that audio is prepended to the
+        # next speech_end so the whole sentence reaches ASR as one piece —
+        # instead of the first half silently vanishing. Guarded by its own
+        # lock: these ops run on the WS thread and must never block on
+        # _protocol_lock (held for seconds during LLM calls).
+        self._carry_lock = threading.Lock()
+        self._pending_voice = None   # (turn id, audio) — unconsumed voice turn
+        self._carry_audio = None     # carried first half awaiting the merge
 
     def _aborted(self, turn):
         """True if this response was cancelled or superseded by a newer turn."""
         return self.cancel_event.is_set() or turn != self._turn
 
+    def _consume_utterance(self, turn):
+        """The machine is acting on this voice turn's words — no longer
+        carryable (a later barge-in must never double-process them)."""
+        with self._carry_lock:
+            if self._pending_voice is not None and self._pending_voice[0] == turn:
+                self._pending_voice = None
+
+    def _clear_carry(self):
+        """Abandon any pause-split fragment (Stop / typed input / fresh
+        session): a stale first half must never prepend to a later utterance."""
+        with self._carry_lock:
+            self._pending_voice = self._carry_audio = None
+
     def on_speech_start(self):
         """Called by main.ws_audio when user starts speaking (barge-in)."""
         if self.state in ("processing", "speaking"):
             logger.info("Barge-in detected! Cancelling current response.")
+            # Continuation, not interruption: if the turn being cancelled is a
+            # voice utterance whose words were never consumed (still in
+            # ASR/NLU flight — the avatar hasn't acted on them), the person is
+            # finishing their own sentence after a pause the VAD read as a
+            # turn end. Carry that audio for the next speech_end.
+            with self._carry_lock:
+                pv = self._pending_voice
+                if pv is not None and pv[0] == self._turn:
+                    self._carry_audio, self._pending_voice = pv[1], None
+                    logger.info("[continuation] pause-split: carrying the "
+                                "unconsumed first half into the next utterance")
             self.cancel_event.set()
             self._turn += 1  # invalidate the in-flight response immediately
             # Clear video queue
@@ -168,6 +204,8 @@ class Pipeline:
                     self.video_queue.get_nowait()
                 except queue.Empty:
                     break
+        # An explicit Stop abandons any pause-split fragment too.
+        self._clear_carry()
         self.state = "idle"
 
     def on_speech_end(self, audio_array):
@@ -175,10 +213,20 @@ class Pipeline:
         audio_array: float32 numpy array at 16kHz.
         """
         self._t0 = time.perf_counter()
+        # Pause-split continuation: prepend the carried first half (if any)
+        # so ASR transcribes the whole utterance in one piece.
+        with self._carry_lock:
+            if self._carry_audio is not None:
+                audio_array = np.concatenate([self._carry_audio, audio_array])
+                self._carry_audio = None
+                logger.info("[continuation] resumed after a pause: merged "
+                            "utterance is now %.2fs", len(audio_array) / 16000)
         self.state = "processing"
         self.cancel_event.clear()
         self._turn += 1
         turn = self._turn
+        with self._carry_lock:
+            self._pending_voice = (turn, audio_array)
 
         # Run processing in background thread
         self._processing_thread = threading.Thread(
@@ -189,6 +237,9 @@ class Pipeline:
     def on_speech_end_text(self, text):
         """Text input: skip ASR and feed text directly into pipeline."""
         self._t0 = time.perf_counter()
+        # Typing supersedes any pause-split voice fragment: never prepend a
+        # stale first half to a LATER voice utterance.
+        self._clear_carry()
         self.state = "processing"
         self.cancel_event.clear()
         self._turn += 1
@@ -205,6 +256,7 @@ class Pipeline:
         greets and asks the first SBIRT question instead of waiting to be spoken
         to. Runs the same synthesis path as a normal turn."""
         self._t0 = time.perf_counter()
+        self._clear_carry()   # a fresh session never inherits a voice fragment
         self.state = "processing"
         self.cancel_event.clear()
         self._turn += 1
@@ -274,6 +326,7 @@ class Pipeline:
         both histories either way."""
         logger.warning("[crisis] deterministic net fired: category=%s pattern=%s",
                        hit.category, hit.pattern)  # no user text in the log
+        self._consume_utterance(turn)   # acting on these words: no longer carryable
         self._history_begin(user_text)
         # Pause the clinical protocol permanently for this session; later
         # turns run the full counselor with the crisis protocol.
@@ -499,6 +552,7 @@ class Pipeline:
             # In-crisis sessions: the protocol stays paused; every turn runs the
             # full counselor (its prompt carries the complete crisis protocol).
             if clinical.crisis:
+                self._consume_utterance(turn)
                 messages = self._history_begin(user_text)
                 self.state = "processing"
                 self._run_crisis_synthesis(messages, turn)
@@ -506,6 +560,7 @@ class Pipeline:
 
             exp = clinical.expect
             if exp.kind == "end":
+                self._consume_utterance(turn)
                 # Session already closed/declined; stay warm, done.
                 return self._deliver_step(user_text, runtime.Step(
                     clinical.node, (runtime.LLMSay(
@@ -525,9 +580,14 @@ class Pipeline:
                                clinical))
 
             # The NLU may have taken a slow LLM round-trip; if a newer turn
-            # started meanwhile (barge-in, typed message), don't touch the machine.
+            # started meanwhile (barge-in, typed message), don't touch the
+            # machine — an unconsumed voice utterance stays carryable so a
+            # pause-split continuation can merge it (modules/carry.py).
             if self._aborted(turn):
                 return
+            # Committing to act on these words: from here on, new speech is a
+            # fresh turn (or a real barge-in), never a continuation-merge.
+            self._consume_utterance(turn)
 
             if out.action == "crisis":
                 # NLU-flagged crisis (union with the deterministic net, which
